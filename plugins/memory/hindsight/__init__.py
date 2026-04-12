@@ -1487,6 +1487,61 @@ class HindsightMemoryProvider(MemoryProvider):
         self._register_atexit()
         self._retain_queue.put(_do_retain)
 
+    def _flush_buffered(self, reason: str = "") -> None:
+        """Force-retain all buffered turns to Hindsight.
+
+        Called before context compression or session end to ensure
+        no buffered turns are lost.  Uses the same document_id as
+        sync_turn so Hindsight deduplicates overlapping content.
+        """
+        if not self._session_turns:
+            return
+        if not self._auto_retain:
+            return
+
+        content = "[" + ",".join(self._session_turns) + "]"
+        num_turns = len(self._session_turns)
+
+        def _sync():
+            try:
+                client = self._get_client()
+                item: dict = {
+                    "content": content,
+                    "context": self._retain_context,
+                }
+                if self._tags:
+                    item["tags"] = self._tags
+                logger.debug(
+                    "Hindsight flush (%s): bank=%s, doc=%s, content_len=%d, num_turns=%d",
+                    reason, self._bank_id, self._session_id, len(content), num_turns,
+                )
+                _run_sync(client.aretain_batch(
+                    bank_id=self._bank_id,
+                    items=[item],
+                    document_id=self._session_id,
+                    retain_async=self._retain_async,
+                ))
+                logger.info(
+                    "Hindsight buffer flushed (%s): %d turns retained",
+                    reason, num_turns,
+                )
+            except Exception as e:
+                logger.warning("Hindsight flush (%s) failed: %s", reason, e, exc_info=True)
+
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=5.0)
+        self._sync_thread = threading.Thread(target=_sync, daemon=True, name="hindsight-flush")
+        self._sync_thread.start()
+
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Flush buffered turns before context compression discards them."""
+        self._flush_buffered(reason="pre-compress")
+        return ""
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Flush buffered turns at session end."""
+        self._flush_buffered(reason="session-end")
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
             return []
