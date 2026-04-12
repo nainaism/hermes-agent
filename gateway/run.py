@@ -14670,6 +14670,10 @@ class GatewayRunner:
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
+            # Suppress rate-limit retry noise from reaching Discord
+            if "Rate limit reached. Waiting" in message:
+                logger.info("status suppressed (rate-limit wait): %s", message)
+                return
             try:
                 _fut = asyncio.run_coroutine_threadsafe(
                     _status_adapter.send(
