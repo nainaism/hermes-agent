@@ -14763,18 +14763,22 @@ class GatewayRunner:
                 from gateway.config import StreamingConfig
                 _scfg = StreamingConfig()
 
-            # Per-platform streaming gate: display.platforms.<plat>.streaming
-            # can disable streaming for specific platforms even when the global
-            # streaming config is enabled.
-            _plat_streaming = resolve_display_setting(
-                user_config, platform_key, "streaming"
+            # Per-platform streaming gate: only display.platforms.<plat>.streaming
+            # is checked as an override.  The global display.streaming is a CLI-only
+            # toggle and must NOT leak into the gateway streaming decision.
+            _plat_streaming = (
+                user_config.get("display", {})
+                .get("platforms", {})
+                .get(platform_key, {})
+                .get("streaming")
             )
-            # None = no per-platform override → follow global config
-            _streaming_enabled = (
-                _scfg.enabled and _scfg.transport != "off"
-                if _plat_streaming is None
-                else bool(_plat_streaming)
-            )
+            # None = no per-platform override → follow global StreamingConfig
+            # True  = explicitly enabled for this platform
+            # False = explicitly disabled for this platform
+            if _plat_streaming is not None:
+                _streaming_enabled = bool(_plat_streaming)
+            else:
+                _streaming_enabled = _scfg.enabled and _scfg.transport != "off"
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages

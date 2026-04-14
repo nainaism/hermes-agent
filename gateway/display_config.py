@@ -34,13 +34,11 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "show_reasoning": False,
     "tool_preview_length": 0,
-    "streaming": None,  # None = follow top-level streaming config
-    # When true, delete tool-progress / "Still working..." / status bubbles
-    # after the final response lands on platforms that support message
-    # deletion (e.g. Telegram). Off by default — progress is still shown
-    # live, just cleaned up after success so the chat doesn't fill up with
-    # stale breadcrumbs. Failed runs leave bubbles in place as breadcrumbs.
-    "cleanup_progress": False,
+    # NOTE: "streaming" is intentionally excluded here.  Gateway streaming is
+    # controlled by the top-level ``streaming`` config section (StreamingConfig),
+    # with per-platform overrides only via ``display.platforms.<plat>.streaming``.
+    # Including it here would cause the CLI-only ``display.streaming`` toggle to
+    # leak into gateway streaming decisions (see #9XXX).
 }
 
 # ---------------------------------------------------------------------------
@@ -55,28 +53,24 @@ _TIER_HIGH = {
     "tool_progress": "all",
     "show_reasoning": False,
     "tool_preview_length": 40,
-    "streaming": None,  # follow global
 }
 
 _TIER_MEDIUM = {
     "tool_progress": "new",
     "show_reasoning": False,
     "tool_preview_length": 40,
-    "streaming": None,
 }
 
 _TIER_LOW = {
     "tool_progress": "off",
     "show_reasoning": False,
     "tool_preview_length": 40,
-    "streaming": False,
 }
 
 _TIER_MINIMAL = {
     "tool_progress": "off",
     "show_reasoning": False,
     "tool_preview_length": 0,
-    "streaming": False,
 }
 
 _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
@@ -146,6 +140,13 @@ def resolve_display_setting(
         val = plat_overrides.get(setting)
         if val is not None:
             return _normalise(setting, val)
+
+    # Special case: "streaming" is controlled by StreamingConfig, not by the
+    # display resolver.  Only per-platform overrides (step 1 above) should be
+    # honoured.  The global display.streaming is a CLI-only toggle and must
+    # never leak into gateway streaming decisions.
+    if setting == "streaming":
+        return fallback
 
     # 1b. Backward compat: display.tool_progress_overrides.<platform>
     if setting == "tool_progress":
