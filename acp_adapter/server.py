@@ -981,10 +981,6 @@ class HermesACPAgent(acp.Agent):
             # sending it again causes a duplicate message in Paseo.
             update = acp.update_agent_message_text(final_response)
             await conn.session_update(session_id, update)
-        logger.info(
-            "ACP prompt done: session=%s stream_fired=%s has_final=%s",
-            session_id, _stream_fired, bool(final_response),
-        )
 
         # Mark this turn idle before draining queued work so recursive prompt()
         # calls can acquire the session. Queued turns are intentionally run as
