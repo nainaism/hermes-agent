@@ -547,7 +547,100 @@ class HermesACPAgent(acp.Agent):
         logger.info("Loaded session %s", session_id)
         await self._replay_session_history(state)
         self._schedule_available_commands_update(session_id)
+
+        # Replay conversation history so the client (Paseo) can rebuild
+        # the timeline.  During loadSession the client sets
+        # replayingHistory=True, which causes every session_update to be
+        # buffered into persistedHistory rather than emitted as events.
+        await self._replay_history(state)
+
         return LoadSessionResponse(models=self._build_model_state(state))
+
+    # ---- History replay ----------------------------------------------------
+
+    async def _replay_history(self, state: "SessionState") -> None:
+        """Send conversation history as ACP session updates for timeline rebuild.
+
+        Paseo sets ``replayingHistory=True`` during ``loadSession``, which
+        buffers every ``session_update`` into ``persistedHistory``.  Those
+        buffered items are later yielded via ``streamHistory()`` to
+        populate the UI timeline.  Without this replay the timeline stays
+        empty after resuming an archived session.
+        """
+        if not self._conn or not state.history:
+            return
+
+        conn = self._conn
+        msg_counter = 0
+
+        for msg in state.history:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            # Skip non-textual roles that Paseo doesn't render as messages
+            if role == "system":
+                continue
+
+            # Extract text from content (may be str or list of content blocks)
+            text = self._extract_content_text(content)
+            if not text:
+                continue
+
+            # Skip tool-result messages (role == "tool") — they appear as
+            # part of the assistant's tool-call timeline item in Paseo.
+            if role == "tool":
+                continue
+
+            msg_id = f"replay-{msg_counter}"
+            msg_counter += 1
+
+            if role == "user":
+                update = acp.update_user_message(acp.text_block(text))
+                # Attach message_id so Paseo groups this as one user bubble
+                update.message_id = msg_id
+            elif role == "assistant":
+                update = acp.update_agent_message(acp.text_block(text))
+                update.message_id = msg_id
+            else:
+                continue
+
+            try:
+                await conn.session_update(state.session_id, update)
+            except Exception:
+                logger.debug("Failed to replay history update", exc_info=True)
+                break
+
+            # Small yield so the event-loop can flush writes without
+            # stalling the loadSession response.
+            await asyncio.sleep(0)
+
+        logger.info(
+            "Replayed %d history messages for session %s",
+            msg_counter,
+            state.session_id,
+        )
+
+    @staticmethod
+    def _extract_content_text(content: Any) -> str:
+        """Normalise ``content`` (str | list[dict] | None) to plain text."""
+        if not content:
+            return ""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use":
+                        # Include tool-call names so the user can see what
+                        # was invoked, but skip the raw JSON args.
+                        parts.append(f"[tool: {block.get('name', '?')}]")
+                elif isinstance(block, str):
+                    parts.append(block)
+            return "\n".join(parts).strip()
+        return str(content).strip()
 
     async def resume_session(
         self,
@@ -888,6 +981,10 @@ class HermesACPAgent(acp.Agent):
             # sending it again causes a duplicate message in Paseo.
             update = acp.update_agent_message_text(final_response)
             await conn.session_update(session_id, update)
+        logger.info(
+            "ACP prompt done: session=%s stream_fired=%s has_final=%s",
+            session_id, _stream_fired, bool(final_response),
+        )
 
         # Mark this turn idle before draining queued work so recursive prompt()
         # calls can acquire the session. Queued turns are intentionally run as
