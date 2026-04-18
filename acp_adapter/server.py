@@ -771,8 +771,6 @@ class HermesACPAgent(acp.Agent):
         def _stream_guard(text: str) -> None:
             nonlocal _stream_fired
             if text is not None:
-                if not _stream_fired:
-                    logger.debug("ACP stream_guard: first non-None chunk for session %s", session_id)
                 _stream_fired = True
             if message_cb is not None:
                 message_cb(text)
@@ -883,8 +881,6 @@ class HermesACPAgent(acp.Agent):
                 )
             except Exception:
                 logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
-        logger.info("ACP prompt done: session=%s stream_fired=%s has_final=%s has_conn=%s",
-                     session_id, _stream_fired, bool(final_response), bool(conn))
         if final_response and conn and not _stream_fired:
             # Only send the final update when streaming did NOT fire.
             # When stream_delta_callback was active, the client already
