@@ -761,7 +761,21 @@ class HermesACPAgent(acp.Agent):
         agent.tool_progress_callback = tool_progress_cb
         agent.thinking_callback = thinking_cb
         agent.step_callback = step_cb
-        agent.stream_delta_callback = message_cb
+
+        # Track whether stream_delta_callback actually fired during the run.
+        # If it did, the final update_agent_message_text is redundant (and
+        # causes Paseo to display a duplicate message) because the client
+        # already received the complete response via streaming chunks.
+        _stream_fired = False
+
+        def _stream_guard(text: str) -> None:
+            nonlocal _stream_fired
+            if text is not None:
+                _stream_fired = True
+            if message_cb is not None:
+                message_cb(text)
+
+        agent.stream_delta_callback = _stream_guard
 
         # Approval callback is per-thread (thread-local, GHSA-qg5c-hvr5-hjgr).
         # Set it INSIDE _run_agent so the TLS write happens in the executor
@@ -867,7 +881,11 @@ class HermesACPAgent(acp.Agent):
                 )
             except Exception:
                 logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
-        if final_response and conn:
+        if final_response and conn and not _stream_fired:
+            # Only send the final update when streaming did NOT fire.
+            # When stream_delta_callback was active, the client already
+            # received the complete response via incremental chunks;
+            # sending it again causes a duplicate message in Paseo.
             update = acp.update_agent_message_text(final_response)
             await conn.session_update(session_id, update)
 
