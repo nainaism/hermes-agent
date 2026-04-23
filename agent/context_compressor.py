@@ -983,6 +983,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 or "model_not_found" in _err_str
                 or "does not exist" in _err_str
                 or "no available channel" in _err_str
+                or "unknown model" in _err_str
             )
             _is_timeout = (
                 _status in {408, 429, 502, 504}
