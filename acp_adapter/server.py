@@ -298,9 +298,25 @@ class HermesACPAgent(acp.Agent):
 
     @staticmethod
     def _resolve_model_selection(raw_model: str, current_provider: str) -> tuple[str, str]:
-        """Resolve ``provider:model`` input into the provider and normalized model id."""
+        """Resolve ``provider:model`` input into the provider and normalized model id.
+
+        The sentinel value ``"default"`` is expanded to the actual default
+        model name from config.yaml so that APIs which do not recognise the
+        literal string receive a real model identifier.
+        """
         target_provider = current_provider
         new_model = raw_model.strip()
+
+        # Expand "default" sentinel to the configured default model.
+        if new_model.lower() == "default":
+            try:
+                from hermes_cli.config import load_config
+                _cfg = load_config().get("model") or {}
+                _resolved = (_cfg.get("default") or "") if isinstance(_cfg, dict) else str(_cfg)
+                if _resolved.strip():
+                    new_model = _resolved.strip()
+            except Exception:
+                logger.debug("Failed to resolve default model from config", exc_info=True)
 
         try:
             from hermes_cli.models import detect_provider_for_model, parse_model_input

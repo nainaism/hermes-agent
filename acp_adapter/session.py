@@ -593,6 +593,14 @@ class SessionManager:
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
 
+        # Resolve "default" sentinel to the actual configured model name.
+        # Paseo (and other ACP clients) may pass model="default" via the
+        # model ID configured in their provider definition.  The ZAI (and
+        # other) APIs reject the literal string "default" as an unknown model.
+        _effective_model = default_model
+        if model and model.strip().lower() != "default":
+            _effective_model = model
+
         kwargs = {
             "platform": "acp",
             "enabled_toolsets": _expand_acp_enabled_toolsets(
@@ -602,7 +610,7 @@ class SessionManager:
             "quiet_mode": True,
             "session_id": session_id,
             "session_db": self._get_db(),
-            "model": model or default_model,
+            "model": _effective_model,
         }
 
         try:
