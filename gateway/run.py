@@ -7599,6 +7599,16 @@ class GatewayRunner:
                     "results. This can happen with some models — try again or "
                     "rephrase your question."
                 )
+            # [NAIS PATCH] Suppress delivery when agent response contains [SILENT].
+            # Strips the marker and returns None so the gateway skips sending.
+            # Transcript/session persistence still proceeds normally.
+            if response and "[SILENT]" in response.upper():
+                logger.info(
+                    "SILENT marker detected — suppressing delivery for %s",
+                    source.chat_id or "unknown",
+                )
+                return None
+
             agent_messages = agent_result.get("messages", [])
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
