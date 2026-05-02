@@ -57,6 +57,13 @@ except ImportError:
     from acp.schema import AuthMethod as AuthMethodAgent  # type: ignore[attr-defined]
 
 from acp_adapter.auth import detect_provider
+
+# Dynamic slash command support — driven by COMMAND_REGISTRY
+try:
+    from hermes_cli.commands import COMMAND_REGISTRY, resolve_command as _resolve_command
+except ImportError:
+    COMMAND_REGISTRY = []
+    def _resolve_command(name): return None
 from acp_adapter.events import (
     make_message_cb,
     make_step_cb,
@@ -157,59 +164,64 @@ def _content_blocks_to_openai_user_content(
 class HermesACPAgent(acp.Agent):
     """ACP Agent implementation wrapping Hermes AIAgent."""
 
-    _SLASH_COMMANDS = {
-        "help": "Show available commands",
-        "model": "Show or change current model",
-        "tools": "List available tools",
-        "context": "Show conversation context info",
-        "reset": "Clear conversation history",
-        "compact": "Compress conversation context",
-        "steer": "Inject guidance into the currently running agent turn",
-        "queue": "Queue a prompt to run after the current turn finishes",
-        "version": "Show Hermes version",
-    }
+    # ACP-specific commands that don't exist in COMMAND_REGISTRY
+    _ACP_ONLY_COMMANDS = ("context", "version")
 
-    _ADVERTISED_COMMANDS = (
-        {
-            "name": "help",
-            "description": "List available commands",
-        },
-        {
-            "name": "model",
-            "description": "Show current model and provider, or switch models",
-            "input_hint": "model name to switch to",
-        },
-        {
-            "name": "tools",
-            "description": "List available tools with descriptions",
-        },
-        {
-            "name": "context",
-            "description": "Show conversation message counts by role",
-        },
-        {
-            "name": "reset",
-            "description": "Clear conversation history",
-        },
-        {
-            "name": "compact",
-            "description": "Compress conversation context",
-        },
-        {
-            "name": "steer",
-            "description": "Inject guidance into the currently running agent turn",
-            "input_hint": "guidance for the active turn",
-        },
-        {
-            "name": "queue",
-            "description": "Queue a prompt to run after the current turn finishes",
-            "input_hint": "prompt to run next",
-        },
-        {
-            "name": "version",
-            "description": "Show Hermes version",
-        },
-    )
+    @classmethod
+    def _acp_commands(cls) -> set[str]:
+        """Dynamically build the set of commands available in ACP.
+
+        Includes commands from COMMAND_REGISTRY where not cli_only and not gateway_only,
+        plus ACP-only commands like 'context' and 'version'.
+        Also includes 'tools' which is cli_only but useful in ACP.
+        """
+        commands: set[str] = set()
+        for cmd in COMMAND_REGISTRY:
+            if not cmd.cli_only and not cmd.gateway_only:
+                commands.add(cmd.name)
+                if cmd.aliases:
+                    commands.update(cmd.aliases)
+        # Include ACP-only commands
+        commands.update(cls._ACP_ONLY_COMMANDS)
+        # Include 'tools' even though cli_only — useful in ACP
+        commands.add("tools")
+        return commands
+
+    @classmethod
+    def _acp_command_handlers(cls) -> dict[str, callable]:
+        """Map command names to handler methods."""
+        return {
+            # Existing handlers
+            "help": cls._cmd_help,
+            "model": cls._cmd_model,
+            "tools": cls._cmd_tools,
+            "context": cls._cmd_context,
+            "reset": cls._cmd_reset,
+            "new": cls._cmd_reset,
+            "compact": cls._cmd_compact,
+            "compress": cls._cmd_compact,
+            "steer": cls._cmd_steer,
+            "queue": cls._cmd_queue,
+            "version": cls._cmd_version,
+            # New handlers
+            "retry": cls._cmd_retry,
+            "undo": cls._cmd_undo,
+            "title": cls._cmd_title,
+            "branch": cls._cmd_branch,
+            "background": cls._cmd_background,
+            "agents": cls._cmd_agents,
+            "goal": cls._cmd_goal,
+            "resume": cls._cmd_resume,
+            "footer": cls._cmd_footer,
+            "yolo": cls._cmd_yolo,
+            "reasoning": cls._cmd_reasoning,
+            "fast": cls._cmd_fast,
+            "curator": cls._cmd_curator,
+            "kanban": cls._cmd_kanban,
+            "usage": cls._cmd_usage,
+            "debug": cls._cmd_debug,
+            "stop": cls._cmd_stop,
+        }
 
     def __init__(self, session_manager: SessionManager | None = None):
         super().__init__()
@@ -1037,18 +1049,24 @@ class HermesACPAgent(acp.Agent):
 
     @classmethod
     def _available_commands(cls) -> list[AvailableCommand]:
+        """Advertise commands from COMMAND_REGISTRY (dynamic)."""
         commands: list[AvailableCommand] = []
-        for spec in cls._ADVERTISED_COMMANDS:
-            input_hint = spec.get("input_hint")
+        for cmd in COMMAND_REGISTRY:
+            if cmd.cli_only or cmd.gateway_only:
+                continue
+            input_hint = cmd.args_hint or None
             commands.append(
                 AvailableCommand(
-                    name=spec["name"],
-                    description=spec["description"],
+                    name=cmd.name,
+                    description=cmd.description,
                     input=UnstructuredCommandInput(hint=input_hint)
                     if input_hint
                     else None,
                 )
             )
+        # Add ACP-only commands
+        commands.append(AvailableCommand(name="context", description="Show conversation message counts by role"))
+        commands.append(AvailableCommand(name="tools", description="List available tools with descriptions"))
         return commands
 
     async def _send_available_commands_update(self, session_id: str) -> None:
@@ -1083,6 +1101,9 @@ class HermesACPAgent(acp.Agent):
     def _handle_slash_command(self, text: str, state: SessionState) -> str | None:
         """Dispatch a slash command and return the response text.
 
+        Uses ``resolve_command()`` from the central ``COMMAND_REGISTRY``
+        so aliases and prefix matching work the same as CLI/Gateway.
+
         Returns ``None`` for unrecognized commands so they fall through
         to the LLM (the user may have typed ``/something`` as prose).
         """
@@ -1090,31 +1111,42 @@ class HermesACPAgent(acp.Agent):
         cmd = parts[0].lstrip("/").lower()
         args = parts[1].strip() if len(parts) > 1 else ""
 
-        handler = {
-            "help": self._cmd_help,
-            "model": self._cmd_model,
-            "tools": self._cmd_tools,
-            "context": self._cmd_context,
-            "reset": self._cmd_reset,
-            "compact": self._cmd_compact,
-            "steer": self._cmd_steer,
-            "queue": self._cmd_queue,
-            "version": self._cmd_version,
-        }.get(cmd)
+        # Resolve aliases via COMMAND_REGISTRY (e.g. "reset" → "new")
+        resolved = _resolve_command(cmd)
+        canonical = resolved.name if resolved else cmd
+
+        # Check if it's a known ACP command
+        if canonical not in self._acp_commands() and cmd not in self._acp_commands():
+            return None  # not a known command — let the LLM handle it
+
+        # Use canonical name for handler lookup
+        lookup_name = canonical if canonical in self._acp_command_handlers() else cmd
+        handler = self._acp_command_handlers().get(lookup_name)
 
         if handler is None:
-            return None  # not a known command — let the LLM handle it
+            return f"/{canonical} is available but not yet implemented for ACP."
 
         try:
             return handler(args, state)
         except Exception as e:
-            logger.error("Slash command /%s error: %s", cmd, e, exc_info=True)
-            return f"Error executing /{cmd}: {e}"
+            logger.error("Slash command /%s error: %s", canonical, e, exc_info=True)
+            return f"Error executing /{canonical}: {e}"
 
     def _cmd_help(self, args: str, state: SessionState) -> str:
+        commands = sorted(self._acp_commands())
         lines = ["Available commands:", ""]
-        for cmd, desc in self._SLASH_COMMANDS.items():
-            lines.append(f"  /{cmd:10s}  {desc}")
+        for name in commands:
+            # Try to get description from COMMAND_REGISTRY
+            resolved = _resolve_command(name)
+            if resolved:
+                desc = resolved.description
+            elif name == "context":
+                desc = "Show conversation message counts by role"
+            elif name == "version":
+                desc = "Show Hermes version"
+            else:
+                desc = ""
+            lines.append(f"  /{name:12s}  {desc}")
         lines.append("")
         lines.append("Unrecognized /commands are sent to the model as normal messages.")
         return "\n".join(lines)
@@ -1268,6 +1300,245 @@ class HermesACPAgent(acp.Agent):
 
     def _cmd_version(self, args: str, state: SessionState) -> str:
         return f"Hermes Agent v{HERMES_VERSION}"
+
+    # ---- New slash command handlers ------------------------------------------
+
+    def _cmd_retry(self, args: str, state: SessionState) -> str:
+        """Resend last user message to agent."""
+        for msg in reversed(state.history):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    parts = [
+                        p.get("text", "")
+                        for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    ]
+                    content = "\n".join(p for p in parts if p)
+                # Remove the last exchange (user + assistant/tool)
+                while state.history and state.history[-1].get("role") != "user":
+                    state.history.pop()
+                if state.history:
+                    state.history.pop()
+                with state.runtime_lock:
+                    state.queued_prompts.append(content)
+                return f"Retrying last message. ({len(state.queued_prompts)} queued)"
+        return "No previous message to retry."
+
+    def _cmd_undo(self, args: str, state: SessionState) -> str:
+        """Remove last user/assistant exchange."""
+        removed = 0
+        while state.history and state.history[-1].get("role") in ("assistant", "tool"):
+            state.history.pop()
+            removed += 1
+        if state.history and state.history[-1].get("role") == "user":
+            state.history.pop()
+            removed += 1
+        self.session_manager.save_session(state.session_id)
+        return f"Undid {removed} message(s)." if removed else "Nothing to undo."
+
+    def _cmd_title(self, args: str, state: SessionState) -> str:
+        """Set session title."""
+        if not args:
+            return "Usage: /title <name>"
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            db.set_session_title(state.session_id, args)
+            return f"Title set to: {args}"
+        except Exception as e:
+            return f"Could not set title: {e}"
+
+    def _cmd_branch(self, args: str, state: SessionState) -> str:
+        """Save current state as a named branch/checkpoint."""
+        branch_name = args.strip() or f"branch-{len(state.history)}"
+        try:
+            import json
+            from pathlib import Path
+            hermes_home = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+            branches_dir = hermes_home / "branches"
+            branches_dir.mkdir(parents=True, exist_ok=True)
+            safe_branch = branch_name.replace("/", "_").replace(" ", "_")
+            branch_file = branches_dir / f"{state.session_id}_{safe_branch}.json"
+            branch_file.write_text(json.dumps(state.history, ensure_ascii=False, default=str))
+            return f"Branch '{branch_name}' saved ({len(state.history)} messages)."
+        except Exception as e:
+            return f"Could not create branch: {e}"
+
+    def _cmd_background(self, args: str, state: SessionState) -> str:
+        """Run prompt in background (same as queue in ACP)."""
+        if not args.strip():
+            return "Usage: /background <prompt>"
+        with state.runtime_lock:
+            state.queued_prompts.append(args.strip())
+            depth = len(state.queued_prompts)
+        return f"Background task queued. ({depth} queued)"
+
+    def _cmd_agents(self, args: str, state: SessionState) -> str:
+        """Show active agent info."""
+        model = state.model or getattr(state.agent, "model", "unknown")
+        provider = getattr(state.agent, "provider", None) or "auto"
+        status = "running" if state.is_running else "idle"
+        return (
+            f"Session: {state.session_id[:8]}\u2026\n"
+            f"Model: {model}\n"
+            f"Provider: {provider}\n"
+            f"Status: {status}"
+        )
+
+    def _cmd_goal(self, args: str, state: SessionState) -> str:
+        """GoalManager integration — same as CLI/Gateway."""
+        try:
+            from hermes_cli.goals import GoalManager
+        except ImportError:
+            return "Goals module not available."
+
+        mgr = GoalManager(session_id=state.session_id, default_max_turns=20)
+        lower = (args or "").strip().lower()
+
+        if not args.strip() or lower == "status":
+            return mgr.status_line()
+
+        if lower == "pause":
+            s = mgr.pause(reason="user-paused")
+            return f"\u23f8 Goal paused: {s.goal}" if s else "No goal set."
+
+        if lower == "resume":
+            s = mgr.resume()
+            if s is None:
+                return "No goal to resume."
+            with state.runtime_lock:
+                state.queued_prompts.append(s.goal)
+            return f"\u25b6 Goal resumed: {s.goal}"
+
+        if lower in ("clear", "stop", "done"):
+            had = mgr.has_goal()
+            mgr.clear()
+            return "\u2713 Goal cleared." if had else "No active goal."
+
+        # Set new goal
+        try:
+            s = mgr.set(args.strip())
+        except ValueError as e:
+            return f"Invalid goal: {e}"
+
+        # Queue the goal as first turn
+        with state.runtime_lock:
+            state.queued_prompts.append(s.goal)
+        return f"\u2299 Goal set ({s.max_turns}-turn budget): {s.goal}"
+
+    def _cmd_resume(self, args: str, state: SessionState) -> str:
+        """Search for sessions to resume."""
+        if not args.strip():
+            return "Usage: /resume <session-id-prefix or name>"
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            sessions = db.search_sessions(args.strip(), limit=5)
+            if not sessions:
+                return f"No sessions matching '{args.strip()}' found."
+            lines = ["Matching sessions:"]
+            for s in sessions:
+                sid = s.get("session_id", "?")
+                title = s.get("title", "") or "(untitled)"
+                updated = s.get("updated_at", "") or ""
+                lines.append(f"  {sid[:12]}\u2026 {title} ({updated})")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Could not search sessions: {e}"
+
+    def _cmd_footer(self, args: str, state: SessionState) -> str:
+        """Toggle footer display."""
+        current = getattr(state, "_show_footer", False)
+        new_val = (
+            not current
+            if not args
+            else args.strip().lower() in ("on", "true", "1")
+        )
+        state._show_footer = new_val
+        return f"Footer {'enabled' if new_val else 'disabled'}."
+
+    def _cmd_yolo(self, args: str, state: SessionState) -> str:
+        """Toggle YOLO mode (skip dangerous command approvals)."""
+        current = getattr(state, "_yolo_mode", False)
+        new_val = (
+            not current
+            if not args
+            else args.strip().lower() in ("on", "true", "1")
+        )
+        state._yolo_mode = new_val
+        agent = state.agent
+        if hasattr(agent, "skip_approvals"):
+            agent.skip_approvals = new_val
+        action = "auto-approve" if new_val else "require approval"
+        if new_val:
+            return f"YOLO mode ON \u26a0\ufe0f. Dangerous commands will {action}."
+        return f"YOLO mode OFF. Dangerous commands will {action}."
+
+    def _cmd_reasoning(self, args: str, state: SessionState) -> str:
+        """Show/manage reasoning effort."""
+        agent = state.agent
+        rc = getattr(agent, "reasoning_config", None)
+        if not args.strip():
+            if not rc:
+                return "Reasoning: default (medium)"
+            effort = rc.get("effort", "medium")
+            enabled = rc.get("enabled", True)
+            return f"Reasoning: {effort} ({'enabled' if enabled else 'disabled'})"
+        lower = args.strip().lower()
+        if lower in ("off", "none"):
+            if hasattr(agent, "reasoning_config"):
+                agent.reasoning_config = {"enabled": False}
+            return "Reasoning disabled."
+        if lower in ("low", "medium", "high"):
+            if hasattr(agent, "reasoning_config"):
+                agent.reasoning_config = {"enabled": True, "effort": lower}
+            return f"Reasoning effort set to: {lower}"
+        return "Usage: /reasoning [low|medium|high|off]"
+
+    def _cmd_fast(self, args: str, state: SessionState) -> str:
+        """Toggle fast mode."""
+        current = getattr(state, "_fast_mode", False)
+        new_val = (
+            not current
+            if not args
+            else args.strip().lower() in ("on", "true", "1")
+        )
+        state._fast_mode = new_val
+        return f"Fast mode {'ON' if new_val else 'OFF'}."
+
+    def _cmd_curator(self, args: str, state: SessionState) -> str:
+        """Skill maintenance status."""
+        return "Curator is available via the skills tool directly in ACP."
+
+    def _cmd_kanban(self, args: str, state: SessionState) -> str:
+        """Kanban board reference."""
+        return "Kanban is available via the kanban tools directly in ACP."
+
+    def _cmd_usage(self, args: str, state: SessionState) -> str:
+        """Show token usage statistics."""
+        agent = state.agent
+        total_input = getattr(agent, "total_input_tokens", 0) or 0
+        total_output = getattr(agent, "total_output_tokens", 0) or 0
+        cost = getattr(agent, "total_cost", 0) or 0
+        model = state.model or getattr(agent, "model", "unknown")
+        lines = [f"Model: {model}"]
+        lines.append(f"Tokens: {total_input:,} in / {total_output:,} out")
+        if cost:
+            lines.append(f"Est. cost: ${cost:.4f}")
+        return "\n".join(lines)
+
+    def _cmd_debug(self, args: str, state: SessionState) -> str:
+        """Debug report — not supported in ACP."""
+        return "Debug report upload is not supported in ACP mode. Check ~/.hermes/logs/ for logs."
+
+    def _cmd_stop(self, args: str, state: SessionState) -> str:
+        """Stop the current agent run."""
+        if hasattr(state.agent, "cancel_event") and state.agent.cancel_event:
+            state.agent.cancel_event.set()
+        if state.cancel_event:
+            state.cancel_event.set()
+        return "Stop requested."
 
     # ---- Model switching (ACP protocol method) -------------------------------
 
