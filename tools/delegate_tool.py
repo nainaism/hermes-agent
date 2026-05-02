@@ -1131,6 +1131,10 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
 
+    # Inherit the parent's api_max_retries so subagents retry just as
+    # aggressively on transient errors (429, timeouts, etc.).
+    child._api_max_retries = getattr(parent_agent, "_api_max_retries", 3)
+
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
     child_pool = _resolve_child_credential_pool(effective_provider, parent_agent)
