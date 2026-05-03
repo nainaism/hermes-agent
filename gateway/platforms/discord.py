@@ -2840,13 +2840,89 @@ class DiscordAdapter(BasePlatformAdapter):
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
 
     def format_message(self, content: str) -> str:
-        """
-        Format message for Discord.
+        """Format message for Discord. Converts markdown tables to mobile-friendly list format."""
+        return self._convert_md_tables(content)
 
-        Discord uses its own markdown variant.
+    @staticmethod
+    def _convert_md_tables(content: str) -> str:
+        """Convert markdown tables to mobile-friendly Discord format.
+
+        2-col tables  → 📋 **col1** | **col2** (header) + **key** value (rows)
+        3+ col tables → 📋 **col1 | col2 | col3** (header) + • **col1** — col2 | col3 (rows)
         """
-        # Discord markdown is fairly standard, no special escaping needed
-        return content
+        import re
+
+        PIPE = '|'
+        BS = '\\'
+        OP = '('
+        CP = ')'
+        NL = '\n'
+        _pat = re.compile(
+            OP + OP + '?:^' + BS + PIPE + '[^' + BS + 'n]*' + BS + PIPE + BS + 's*(?:' + BS + 'n' + PIPE + '$))+' + CP,
+            re.MULTILINE,
+        )
+
+        def _replace(m):
+            lines = [l.rstrip() for l in m.group(1).split(NL)
+                     if l.strip().startswith(PIPE)]
+            if len(lines) < 2:
+                return m.group(0)
+
+            def _row(line):
+                return [c.strip() for c in line.strip().strip(PIPE).split(PIPE)]
+
+            rows = [_row(l) for l in lines]
+            sep = next((i for i, r in enumerate(rows)
+                        if all(re.match(r'^[-:]+$', c.strip()) for c in r)), None)
+
+            if sep is not None:
+                hdrs = rows[sep - 1] if sep > 0 else None
+                data = [r for i, r in enumerate(rows) if i not in (sep, sep - 1)]
+            else:
+                hdrs = rows[0]
+                data = rows[1:]
+
+            if not hdrs:
+                return m.group(0)
+
+            ncols = len(hdrs)
+            out_lines = []
+
+            # Detect if first column is a number column (#, No., etc.)
+            first_is_num = bool(hdrs) and re.match(r'^(#|no\.?|num|番号|id)$', hdrs[0].strip(), re.I)
+
+            if ncols == 2:
+                # 2-column: header + **key** value
+                h0 = hdrs[0].strip() if len(hdrs) > 0 else ''
+                h1 = hdrs[1].strip() if len(hdrs) > 1 else ''
+                out_lines.append(f'📋 **{h0}** | **{h1}**')
+                for row in data:
+                    key = row[0] if len(row) > 0 else ''
+                    val = row[1] if len(row) > 1 else ''
+                    out_lines.append(f'**{key}** {val}')
+                out_lines.append('')
+            else:
+                # 3+ column: header + list format
+                hdr_line = ' | '.join(f'**{c.strip()}**' for c in hdrs if c.strip())
+                out_lines.append(f'📋 {hdr_line}')
+                for row in data:
+                    if first_is_num:
+                        # Use first col as number, remaining as content
+                        num = row[0] if len(row) > 0 else ''
+                        label = row[1] if len(row) > 1 else ''
+                        rest = ' | '.join(c for c in row[2:]) if len(row) > 2 else ''
+                        if label:
+                            out_lines.append(f'{num}. **{label}** — {rest}' if rest else f'{num}. **{label}**')
+                    else:
+                        label = row[0] if len(row) > 0 else ''
+                        rest = ' | '.join(c for c in row[1:]) if len(row) > 1 else ''
+                        if label:
+                            out_lines.append(f'• **{label}** — {rest}' if rest else f'• **{label}**')
+                out_lines.append('')
+
+            return '\n'.join(out_lines)
+
+        return _pat.sub(_replace, content)
 
     async def _run_simple_slash(
         self,
