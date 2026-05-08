@@ -1127,7 +1127,7 @@ class HermesACPAgent(acp.Agent):
             return f"/{canonical} is available but not yet implemented for ACP."
 
         try:
-            return handler(args, state)
+            return handler(self, args, state)
         except Exception as e:
             logger.error("Slash command /%s error: %s", canonical, e, exc_info=True)
             return f"Error executing /{canonical}: {e}"
