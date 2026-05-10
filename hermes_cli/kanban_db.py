@@ -403,11 +403,17 @@ def write_board_metadata(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     archived: Optional[bool] = None,
+    **extra: Any,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
+
+    ``**extra`` captures arbitrary additional fields (e.g.
+    ``embed_channel_id``, ``embed_msg_id``) and merges them into the
+    stored metadata so board.json can be extended without schema
+    changes.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
@@ -424,6 +430,8 @@ def write_board_metadata(
         meta["color"] = str(color)
     if archived is not None:
         meta["archived"] = bool(archived)
+    if extra:
+        meta.update(extra)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)

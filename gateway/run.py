@@ -4410,6 +4410,13 @@ class GatewayRunner:
                             )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
+            # ── Phase 2: Update board embed for any board with embed_channel_id ──
+            try:
+                await self._update_kanban_board_embeds()
+            except Exception as exc:
+                logger.warning(
+                    "kanban board embed update failed: %s", exc,
+                )
             # Sleep with cancellation checks.
             for _ in range(int(max(1, interval))):
                 if not self._running:
@@ -4474,6 +4481,198 @@ class GatewayRunner:
             )
         finally:
             conn.close()
+
+    async def _update_kanban_board_embeds(self) -> None:
+        """Phase 2 of notifier tick: update board embeds for all boards.
+
+        Iterates every board with ``embed_channel_id`` set in its
+        ``board.json`` metadata.  For each board:
+
+        * Queries the kanban DB for task counts by status + recent done
+          tasks.
+        * Builds a ``discord.Embed`` with status sections.
+        * POSTs (new) or PATCHes (existing) the embed message in the
+          configured channel.
+        * Persists the message ID to ``board.json`` after a first POST
+          so future ticks PATCH instead.
+
+        Gracefully handles deleted embed messages (404 → re-POST).
+        Runs inside ``asyncio.to_thread`` for SQLite queries; the
+        Discord API calls are async.
+        """
+        from hermes_cli import kanban_db as _kb
+        from gateway.config import Platform as _Platform
+
+        discord_adapter = self.adapters.get(_Platform.DISCORD)
+        if discord_adapter is None:
+            return  # Discord not connected; nothing to do.
+
+        # The discord module is guaranteed available when the Discord
+        # adapter is connected; the lazy import avoids a hard dependency
+        # for gateways that don't use Discord.
+        try:
+            import discord
+        except ImportError:
+            logger.warning(
+                "kanban board embed: discord module not available; skipping"
+            )
+            return
+
+        try:
+            boards = await asyncio.to_thread(_kb.list_boards, include_archived=False)
+        except Exception:
+            boards = [await asyncio.to_thread(_kb.read_board_metadata, _kb.DEFAULT_BOARD)]
+
+        for board_meta in boards:
+            embed_channel_id = board_meta.get("embed_channel_id")
+            if not embed_channel_id:
+                continue
+
+            slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+            name = board_meta.get("name", slug)
+
+            try:
+                # ── Query task data in a thread ──
+                def _query_board(slug: str) -> dict:
+                    conn = _kb.connect(board=slug)
+                    try:
+                        _kb.init_db(board=slug)
+                        all_tasks = _kb.list_tasks(conn)
+                        # Count by status (exclude archived)
+                        counts: dict[str, int] = {}
+                        by_status: dict[str, list] = {}
+                        for t in all_tasks:
+                            if t.status == "archived":
+                                continue
+                            counts[t.status] = counts.get(t.status, 0) + 1
+                            by_status.setdefault(t.status, []).append(t)
+                        # Recent done: last 3 completed
+                        done_tasks = sorted(
+                            by_status.get("done", []),
+                            key=lambda t: t.completed_at or 0,
+                            reverse=True,
+                        )
+                        return {
+                            "counts": counts,
+                            "by_status": by_status,
+                            "recent_done": done_tasks[:3],
+                            "total_done": len(done_tasks),
+                            "total_active": sum(
+                                c for s, c in counts.items() if s != "done"
+                            ),
+                        }
+                    finally:
+                        conn.close()
+
+                data = await asyncio.to_thread(_query_board, slug)
+
+                # ── Build embed ──
+                import datetime
+                now = datetime.datetime.utcnow()
+                embed = discord.Embed(
+                    title=f"📋 Kanban Board — {name}",
+                    color=discord.Color.blurple(),
+                )
+
+                STATUS_EMOJI = {
+                    "triage": "🆕",
+                    "todo": "🔴",
+                    "ready": "🔵",
+                    "running": "🟡",
+                    "blocked": "⏸",
+                    "done": "✅",
+                }
+                STATUS_LABEL = {
+                    "triage": "Triage",
+                    "todo": "Todo",
+                    "ready": "Ready",
+                    "running": "In Progress",
+                    "blocked": "Blocked",
+                    "done": "Done Today",
+                }
+                # Priority order for fields
+                status_order = ["triage", "todo", "ready", "running", "blocked"]
+
+                for s in status_order:
+                    tasks = data["by_status"].get(s, [])
+                    cnt = data["counts"].get(s, 0)
+                    emoji = STATUS_EMOJI.get(s, "•")
+                    label = STATUS_LABEL.get(s, s.capitalize())
+                    if cnt == 0:
+                        value = "(empty)"
+                    else:
+                        lines = []
+                        for t in tasks[:15]:  # cap at 15 per field
+                            short_id = t.id[:8]
+                            title_disp = (t.title or "")[:40]
+                            assignee = f" ← @{t.assignee}" if t.assignee else ""
+                            lines.append(f"• `{short_id}` {title_disp}{assignee}")
+                        value = "\n".join(lines)
+                        if cnt > 15:
+                            value += f"\n  +{cnt - 15} more"
+                    embed.add_field(
+                        name=f"{emoji} {label} ({cnt})",
+                        value=value,
+                        inline=False,
+                    )
+
+                # Recent done
+                recent = data["recent_done"]
+                total_done = data["total_done"]
+                if recent:
+                    lines = []
+                    for t in recent:
+                        short_id = t.id[:8]
+                        title_disp = (t.title or "")[:40]
+                        lines.append(f"• `{short_id}` {title_disp}")
+                    done_value = "\n".join(lines)
+                    if total_done > 3:
+                        done_value += f"\n  +{total_done - 3} more"
+                else:
+                    done_value = "(none)"
+                embed.add_field(
+                    name=f"✅ Done Today ({total_done})",
+                    value=done_value,
+                    inline=False,
+                )
+
+                # Footer with timestamp
+                embed.set_footer(
+                    text=f"🔄 auto-updates every 5s · "
+                         f"{total_done} done · "
+                         f"{data['total_active']} active · "
+                         f"{now.strftime('%H:%M:%S')} UTC"
+                )
+
+                # ── Send or update ──
+                embed_msg_id = board_meta.get("embed_msg_id")
+                if embed_msg_id:
+                    result = await discord_adapter.edit_embed(
+                        str(embed_channel_id), str(embed_msg_id), embed,
+                    )
+                    if not result.success and "deleted" in (result.error or ""):
+                        # Message was deleted; re-POST
+                        embed_msg_id = None
+
+                if not embed_msg_id:
+                    result = await discord_adapter.send_embed(
+                        str(embed_channel_id), embed,
+                    )
+                    if result.success:
+                        # Persist the new message ID to board.json
+                        def _save_msg_id(slug: str, msg_id: str) -> None:
+                            _kb.write_board_metadata(
+                                slug, embed_msg_id=msg_id,
+                            )
+                        await asyncio.to_thread(
+                            _save_msg_id, slug, result.message_id,
+                        )
+
+            except Exception as exc:
+                logger.warning(
+                    "kanban board embed update failed for %s: %s",
+                    slug, exc,
+                )
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.

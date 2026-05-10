@@ -1608,6 +1608,59 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    async def send_embed(
+        self,
+        chat_id: str,
+        embed: discord.Embed,
+    ) -> SendResult:
+        """Send an embed message to a Discord channel.
+
+        Returns the message ID on success. Does NOT support thread
+        targeting — boards live in top-level channels.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+            msg = await channel.send(embed=embed)
+            return SendResult(success=True, message_id=str(msg.id))
+        except Exception as e:
+            logger.error(
+                "[%s] Failed to send embed to %s: %s", self.name, chat_id, e,
+            )
+            return SendResult(success=False, error=str(e))
+
+    async def edit_embed(
+        self,
+        chat_id: str,
+        message_id: str,
+        embed: discord.Embed,
+    ) -> SendResult:
+        """Edit an existing embed message.
+
+        Returns success=False if the message was deleted (404) so the
+        caller can fall back to sending a new embed.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+            msg = await channel.fetch_message(int(message_id))
+            await msg.edit(embed=embed)
+            return SendResult(success=True, message_id=message_id)
+        except discord.NotFound:
+            return SendResult(success=False, error="Message not found (deleted)")
+        except Exception as e:
+            logger.error(
+                "[%s] Failed to edit embed %s in %s: %s",
+                self.name, message_id, chat_id, e,
+            )
+            return SendResult(success=False, error=str(e))
+
     async def _send_file_attachment(
         self,
         chat_id: str,
