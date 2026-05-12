@@ -4514,10 +4514,6 @@ class GatewayRunner:
         except Exception:
             kanban_cfg = {}
         embed_updates = kanban_cfg.get("embed_updates", True)
-        logger.info(
-            "kanban board embed: embed_updates=%s (kanban_cfg=%s, _hermes_home=%s)",
-            embed_updates, kanban_cfg, _hermes_home,
-        )
         if not embed_updates:
             return  # This profile is not responsible for embed updates.
 
