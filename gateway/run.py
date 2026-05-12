@@ -4552,6 +4552,7 @@ class GatewayRunner:
             try:
                 # ── Query task data in a thread ──
                 def _query_board(slug: str) -> dict:
+                    import datetime as _dt  # local import for thread safety
                     conn = _kb.connect(board=slug)
                     try:
                         _kb.init_db(board=slug)
@@ -4565,7 +4566,7 @@ class GatewayRunner:
                             counts[t.status] = counts.get(t.status, 0) + 1
                             by_status.setdefault(t.status, []).append(t)
                         # Recent done: last 5 completed within 24 hours
-                        _now_ts = datetime.datetime.utcnow().timestamp()
+                        _now_ts = _dt.datetime.utcnow().timestamp()
                         _24h_ago = _now_ts - 86400  # 24 hours ago
                         done_tasks = sorted(
                             by_status.get("done", []),
@@ -4592,8 +4593,8 @@ class GatewayRunner:
                 data = await asyncio.to_thread(_query_board, slug)
 
                 # ── Build embed ──
-                import datetime
-                now = datetime.datetime.utcnow()
+                import datetime as _dt
+                now = _dt.datetime.utcnow()
                 embed = discord.Embed(
                     title=f"📋 Kanban Board — {name}",
                     color=discord.Color.blurple(),
@@ -4662,7 +4663,7 @@ class GatewayRunner:
                 )
 
                 # Footer with timestamp (JST = UTC+9)
-                now_jst = now + datetime.timedelta(hours=9)
+                now_jst = now + _dt.timedelta(hours=9)
                 embed.set_footer(
                     text=f"🔄 auto-updates every 5s · "
                          f"{total_done} done · "
