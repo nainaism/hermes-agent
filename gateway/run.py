@@ -4506,8 +4506,10 @@ class GatewayRunner:
         # ── Config gate: only update embeds if kanban.embed_updates is true ──
         # In multi-profile setups, only the orchestrator (coo/default) should
         # own the embed board. Other profiles set embed_updates: false.
+        # NOTE: Use _load_gateway_config() (returns raw dict) instead of
+        # load_gateway_config() (returns GatewayConfig which lacks kanban).
         try:
-            cfg = load_gateway_config()
+            cfg = _load_gateway_config()
             kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
         except Exception:
             kanban_cfg = {}
