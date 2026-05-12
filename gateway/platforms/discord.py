@@ -1650,6 +1650,18 @@ class DiscordAdapter(BasePlatformAdapter):
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
             msg = await channel.fetch_message(int(message_id))
+            # Skip editing messages authored by other bots to avoid
+            # infinite 403 loops in multi-gateway setups where multiple
+            # profiles share the same board.json.
+            if msg.author.id != self._client.user.id:
+                logger.info(
+                    "[%s] Embed %s owned by %s (not us); skipping edit",
+                    self.name, message_id, msg.author,
+                )
+                return SendResult(
+                    success=False,
+                    error="Cannot edit foreign embed (50005)",
+                )
             await msg.edit(embed=embed)
             return SendResult(success=True, message_id=message_id)
         except discord.NotFound:

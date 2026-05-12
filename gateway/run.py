@@ -4503,6 +4503,22 @@ class GatewayRunner:
         from hermes_cli import kanban_db as _kb
         from gateway.config import Platform as _Platform
 
+        # ── Config gate: only update embeds if kanban.embed_updates is true ──
+        # In multi-profile setups, only the orchestrator (coo/default) should
+        # own the embed board. Other profiles set embed_updates: false.
+        try:
+            cfg = load_gateway_config()
+            kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        except Exception:
+            kanban_cfg = {}
+        embed_updates = kanban_cfg.get("embed_updates", True)
+        logger.info(
+            "kanban board embed: embed_updates=%s (kanban_cfg=%s, _hermes_home=%s)",
+            embed_updates, kanban_cfg, _hermes_home,
+        )
+        if not embed_updates:
+            return  # This profile is not responsible for embed updates.
+
         discord_adapter = self.adapters.get(_Platform.DISCORD)
         if discord_adapter is None:
             return  # Discord not connected; nothing to do.
@@ -4546,17 +4562,24 @@ class GatewayRunner:
                                 continue
                             counts[t.status] = counts.get(t.status, 0) + 1
                             by_status.setdefault(t.status, []).append(t)
-                        # Recent done: last 3 completed
+                        # Recent done: last 5 completed within 24 hours
+                        _now_ts = datetime.datetime.utcnow().timestamp()
+                        _24h_ago = _now_ts - 86400  # 24 hours ago
                         done_tasks = sorted(
                             by_status.get("done", []),
                             key=lambda t: t.completed_at or 0,
                             reverse=True,
                         )
+                        # Filter to tasks completed within the last 24 hours
+                        recent_24h = [
+                            t for t in done_tasks
+                            if (t.completed_at or 0) >= _24h_ago
+                        ]
                         return {
                             "counts": counts,
                             "by_status": by_status,
-                            "recent_done": done_tasks[:3],
-                            "total_done": len(done_tasks),
+                            "recent_done": recent_24h[:5],
+                            "total_done": len(recent_24h),
                             "total_active": sum(
                                 c for s, c in counts.items() if s != "done"
                             ),
@@ -4588,7 +4611,7 @@ class GatewayRunner:
                     "ready": "Ready",
                     "running": "In Progress",
                     "blocked": "Blocked",
-                    "done": "Done Today",
+                    "done": "Done (24h)",
                 }
                 # Priority order for fields
                 status_order = ["triage", "todo", "ready", "running", "blocked"]
@@ -4626,22 +4649,23 @@ class GatewayRunner:
                         title_disp = (t.title or "")[:40]
                         lines.append(f"• `{short_id}` {title_disp}")
                     done_value = "\n".join(lines)
-                    if total_done > 3:
-                        done_value += f"\n  +{total_done - 3} more"
+                    if total_done > 5:
+                        done_value += f"\n  +{total_done - 5} more"
                 else:
                     done_value = "(none)"
                 embed.add_field(
-                    name=f"✅ Done Today ({total_done})",
+                    name=f"✅ Done (24h) ({total_done})",
                     value=done_value,
                     inline=False,
                 )
 
-                # Footer with timestamp
+                # Footer with timestamp (JST = UTC+9)
+                now_jst = now + datetime.timedelta(hours=9)
                 embed.set_footer(
                     text=f"🔄 auto-updates every 5s · "
                          f"{total_done} done · "
                          f"{data['total_active']} active · "
-                         f"{now.strftime('%H:%M:%S')} UTC"
+                         f"{now_jst.strftime('%H:%M:%S')} JST"
                 )
 
                 # ── Send or update ──
