@@ -625,8 +625,20 @@ class SessionManager:
                     "args": list(runtime.get("args") or []),
                 }
             )
+            # Pass credential pool so rate-limit exhaustion can rotate keys.
+            cp = runtime.get("credential_pool")
+            if cp is not None:
+                kwargs["credential_pool"] = cp
         except Exception:
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
+
+        # Forward fallback_providers / fallback_model to AIAgent so ACP
+        # sessions survive primary provider failures (auth, rate-limit, etc.).
+        fb = config.get("fallback_providers") or config.get("fallback_model") or []
+        if isinstance(fb, dict):
+            fb = [fb]
+        if fb:
+            kwargs["fallback_model"] = fb
 
         _register_task_cwd(session_id, cwd)
         agent = AIAgent(**kwargs)
