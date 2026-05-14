@@ -2058,6 +2058,14 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
+    "TINYFISH_API_KEY": {
+        "description": "TinyFish API key for free web search and URL extraction",
+        "prompt": "TinyFish API key",
+        "url": "https://agent.tinyfish.ai",
+        "tools": ["web_search", "web_extract"],
+        "password": True,
+        "category": "tool",
+    },
     "BROWSERBASE_API_KEY": {
         "description": "Browserbase API key for cloud browser (optional — local browser works without this)",
         "prompt": "Browserbase API key",
@@ -4916,7 +4924,7 @@ def set_config_value(key: str, value: str):
         'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',
         'SUDO_PASSWORD', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',
         'GITHUB_TOKEN', 'HONCHO_API_KEY', 'WANDB_API_KEY',
-        'TINKER_API_KEY',
+        'TINKER_API_KEY', 'TINYFISH_API_KEY', 'BRAVE_SEARCH_API_KEY',
     ]
     
     if key.upper() in api_keys or key.upper().endswith(('_API_KEY', '_TOKEN')) or key.upper().startswith('TERMINAL_SSH'):

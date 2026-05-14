@@ -322,6 +322,15 @@ TOOL_CATEGORIES = {
                 "env_vars": [],
                 "post_setup": "ddgs",
             },
+            {
+                "name": "TinyFish",
+                "badge": "free · search + extract",
+                "tag": "Free web search (5 req/min) and URL extraction (25 url/min) via TinyFish API",
+                "web_backend": "tinyfish",
+                "env_vars": [
+                    {"key": "TINYFISH_API_KEY", "prompt": "TinyFish API key", "url": "https://agent.tinyfish.ai"},
+                ],
+            },
         ],
     },
     "image_gen": {
