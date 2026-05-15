@@ -614,6 +614,9 @@ class Task:
     # ``kanban.failure_limit`` config, and then to ``DEFAULT_FAILURE_LIMIT``.
     # Name matches the ``--max-retries`` CLI flag on ``kanban create``.
     max_retries: Optional[int] = None
+    # When True, the worker subprocess runs in goal mode (multi-turn
+    # auto-continuation via judge loop instead of single-shot -q).
+    goal_mode: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -677,6 +680,9 @@ class Task:
             skills=skills_value,
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
+            ),
+            goal_mode=(
+                bool(row["goal_mode"]) if "goal_mode" in keys else False
             ),
         )
 
@@ -1084,6 +1090,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # they were getting before the column existed).
         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
 
+    if "goal_mode" not in cols:
+        # Goal mode enables multi-turn auto-continuation (--goal flag on
+        # the chat subcommand). Existing rows get 0 (unset) which is the
+        # safe default — single-shot behaviour preserved.
+        conn.execute("ALTER TABLE tasks ADD COLUMN goal_mode INTEGER NOT NULL DEFAULT 0")
+
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
@@ -1252,6 +1264,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
+    goal_mode: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -1385,8 +1398,8 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         tenant, idempotency_key, max_runtime_seconds, skills,
-                        max_retries
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        max_retries, goal_mode
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -1404,6 +1417,7 @@ def create_task(
                         int(max_runtime_seconds) if max_runtime_seconds else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
+                        1 if goal_mode else 0,
                     ),
                 )
                 for pid in parents:
@@ -4008,6 +4022,8 @@ def _default_spawn(
         for sk in task.skills:
             if sk and sk != "kanban-worker":
                 cmd.extend(["--skills", sk])
+    if task.goal_mode:
+        cmd.append("--goal")
     cmd.extend([
         "chat",
         "-q", prompt,

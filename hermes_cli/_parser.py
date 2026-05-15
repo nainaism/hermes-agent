@@ -277,6 +277,13 @@ def build_top_level_parser():
         help="Quiet mode for programmatic use: suppress banner, spinner, and tool previews. Only output the final response and session info.",
     )
     chat_parser.add_argument(
+        "--goal",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Goal mode: run multi-turn with auto-continuation (requires -q/--query). "
+             "Uses the auxiliary judge model to determine completion.",
+    )
+    chat_parser.add_argument(
         "--resume",
         "-r",
         metavar="SESSION_ID",

@@ -13272,6 +13272,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    goal: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -13514,6 +13515,59 @@ def main(
                     ):
                         cli.session_id = cli.agent.session_id
                     response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                    
+                    # ── Goal mode: multi-turn auto-continuation ──
+                    # After the initial response, run a judge loop that feeds
+                    # continuation prompts back into the agent until the goal
+                    # is achieved or the turn budget is exhausted.
+                    if goal and query:
+                        try:
+                            from hermes_cli.goals import GoalManager
+                            mgr = GoalManager(session_id=cli.session_id)
+                            goal_max_turns = max_turns or None
+                            mgr.set(query, max_turns=goal_max_turns)
+
+                            last_response = response
+                            while True:
+                                decision = mgr.evaluate_after_turn(
+                                    last_response, user_initiated=False
+                                )
+                                if not decision.get("should_continue"):
+                                    if decision.get("status") == "done":
+                                        logger.info(
+                                            "Goal achieved: %s",
+                                            decision.get("reason", ""),
+                                        )
+                                    break
+                                continuation = decision.get("continuation_prompt")
+                                if not continuation:
+                                    break
+
+                                result = cli.agent.run_conversation(
+                                    user_message=continuation,
+                                    conversation_history=cli.conversation_history,
+                                )
+                                # Sync session_id across continuations
+                                if (
+                                    getattr(cli.agent, "session_id", None)
+                                    and cli.agent.session_id != cli.session_id
+                                ):
+                                    cli.session_id = cli.agent.session_id
+                                last_response = (
+                                    result.get("final_response", "")
+                                    if isinstance(result, dict)
+                                    else str(result)
+                                )
+
+                            # Final output = last turn's response
+                            response = last_response
+                        except Exception as _goal_exc:
+                            logger.warning(
+                                "Goal loop failed: %s", _goal_exc
+                            )
+                            # Fall through to normal output with whatever
+                            # response we have so far.
+                    
                     # Surface backend errors that produced no visible output
                     # (e.g. invalid model slug → provider 4xx). Mirrors the
                     # interactive CLI path. Write to stderr so piped stdout
