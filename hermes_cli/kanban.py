@@ -294,6 +294,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "two retries. Omit to use the dispatcher's "
                                "kanban.failure_limit config "
                                f"(default {kb.DEFAULT_FAILURE_LIMIT}).")
+    p_create.add_argument("--goal-mode", action="store_true", default=False,
+                          help="Enable goal mode: worker runs in multi-turn "
+                               "auto-continuation (--goal flag) instead of "
+                               "single-shot. The judge model evaluates "
+                               "completion after each turn.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- list ---
@@ -1077,6 +1082,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
+            goal_mode=getattr(args, "goal_mode", False),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
