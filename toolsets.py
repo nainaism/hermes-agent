@@ -343,6 +343,7 @@ TOOLSETS = {
             "todo", "memory",
             "session_search",
             "execute_code", "delegate_task",
+            "x_search",
         ],
         "includes": []
     },
