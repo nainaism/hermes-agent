@@ -1618,6 +1618,27 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    # [NAIS PATCH] delete_message — needed for SILENT suppression cleanup
+    # when streaming has already delivered a message that should be suppressed.
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """Delete a previously sent Discord message."""
+        if not self._client:
+            return False
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+            msg = await channel.fetch_message(int(message_id))
+            await msg.delete()
+            return True
+        except Exception as e:
+            logger.debug("[%s] Failed to delete Discord message %s: %s", self.name, message_id, e)
+            return False
+
     async def send_embed(
         self,
         chat_id: str,

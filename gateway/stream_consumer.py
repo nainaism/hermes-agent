@@ -163,6 +163,10 @@ class GatewayStreamConsumer:
             getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
         )
 
+        # [NAIS PATCH] Silent suppression — set when [SILENT] marker detected
+        # in streamed content so the consumer stops sending and cleans up.
+        self._silent_detected = False
+
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
         self._think_buffer = ""
@@ -414,6 +418,37 @@ class GatewayStreamConsumer:
                 # tag is not lost.
                 if got_done:
                     self._flush_think_buffer()
+
+                # [NAIS PATCH] Check for SILENT marker in accumulated stream text.
+                # When detected, set flag, clear accumulated text, and attempt
+                # to delete any already-sent message so Discord/Telegram gets
+                # nothing.  The gateway/run.py post-completion check also
+                # catches this, but streaming may have already delivered the
+                # text by then — this catches it as early as possible.
+                if not self._silent_detected and self._accumulated:
+                    if "[SILENT]" in self._accumulated.upper():
+                        self._silent_detected = True
+                        logger.info(
+                            "SILENT marker detected in stream — suppressing for %s",
+                            self.chat_id,
+                        )
+                        # Try to delete the already-sent message
+                        if self._message_id and self._message_id != "__no_edit__":
+                            try:
+                                await self.adapter.delete_message(
+                                    self.chat_id, self._message_id,
+                                )
+                            except Exception:
+                                pass
+                        self._accumulated = ""
+                        self._message_id = None
+
+                if self._silent_detected:
+                    # Drain remaining items but don't send anything
+                    if got_done:
+                        self._already_sent = True
+                        return
+                    continue
 
                 # Decide whether to flush an edit
                 now = time.monotonic()
