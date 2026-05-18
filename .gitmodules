@@ -1,6 +1,3 @@
-[submodule "tinker-atropos"]
-	path = tinker-atropos
-	url = https://github.com/nousresearch/tinker-atropos
 [submodule "plugins/context_engine/lcm"]
 	path = plugins/context_engine/lcm
 	url = https://github.com/stephenschoettler/hermes-lcm

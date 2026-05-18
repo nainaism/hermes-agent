@@ -1,0 +1,7 @@
+name: web-tinyfish
+version: 1.0.0
+description: "TinyFish web search and content extraction. Free-tier APIs — no credit card required. Requires TINYFISH_API_KEY — sign up at https://tinyfish.ai."
+author: nainaism
+kind: backend
+provides_web_providers:
+  - tinyfish
