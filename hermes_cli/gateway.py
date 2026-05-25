@@ -2815,6 +2815,31 @@ def generate_launchd_plist() -> str:
     ])
     prog_args_xml = "\n        ".join(prog_args)
 
+    # Inject .env variables into the plist EnvironmentVariables.
+    # launchd does NOT read ~/.hermes/.env, so ${VAR} references in
+    # config.yaml remain unresolved unless we explicitly pass them here.
+    # This prevents 401 authentication errors from custom providers
+    # (e.g. Ollama Cloud, crof.ai) whose API keys live in .env.
+    env_vars = {
+        "PATH": sane_path,
+        "VIRTUAL_ENV": venv_dir,
+        "HERMES_HOME": hermes_home,
+    }
+    env_file = Path(hermes_home) / ".env"
+    if env_file.exists():
+        try:
+            from dotenv import dotenv_values
+            dot_env = dotenv_values(env_file)
+            for key, value in dot_env.items():
+                if key and value is not None:
+                    env_vars[key] = value
+        except Exception:
+            pass  # Best-effort; .env parse failures should not block plist generation
+    env_xml = "\n        ".join(
+        f"<key>{k}</key>\n        <string>{v}</string>"
+        for k, v in env_vars.items()
+    )
+
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -2832,12 +2857,7 @@ def generate_launchd_plist() -> str:
     
     <key>EnvironmentVariables</key>
     <dict>
-        <key>PATH</key>
-        <string>{sane_path}</string>
-        <key>VIRTUAL_ENV</key>
-        <string>{venv_dir}</string>
-        <key>HERMES_HOME</key>
-        <string>{hermes_home}</string>
+        {env_xml}
     </dict>
     
     <key>RunAtLoad</key>

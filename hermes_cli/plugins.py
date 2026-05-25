@@ -143,6 +143,9 @@ VALID_HOOKS: Set[str] = {
     "on_session_finalize",
     "on_session_reset",
     "subagent_stop",
+    # Kanban task completion — fired by kanban_tools after successful
+    # complete_task.  kwargs: task_id, summary.
+    "kanban_task_completed",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
     # after the internal-event guard but BEFORE auth/pairing and agent
     # dispatch. Plugins may return a dict to influence flow:

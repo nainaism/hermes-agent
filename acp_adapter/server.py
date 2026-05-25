@@ -236,9 +236,18 @@ class HermesACPAgent(acp.Agent):
     # ---- Connection lifecycle -----------------------------------------------
 
     def on_connect(self, conn: acp.Client) -> None:
-        """Store the client connection for sending session updates."""
+        """Store the client connection and start the kanban watcher."""
         self._conn = conn
         logger.info("ACP client connected")
+
+        # Start the kanban completion watcher so ACP sessions receive
+        # notifications when subscribed kanban tasks reach a terminal state.
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._kanban_acp_watcher())
+            logger.info("Kanban ACP watcher started")
+        except RuntimeError:
+            logger.warning("No running event loop — kanban watcher not started")
 
     @staticmethod
     def _encode_model_choice(provider: str | None, model: str | None) -> str:
@@ -1099,6 +1108,11 @@ class HermesACPAgent(acp.Agent):
             # and the non-interactive auto-approve path must not fire.
             previous_interactive = os.environ.get("HERMES_INTERACTIVE")
             os.environ["HERMES_INTERACTIVE"] = "1"
+
+            # Expose the ACP session id so kanban_create can auto-subscribe
+            # the caller for completion notifications (platform="acp").
+            previous_acp_sid = os.environ.get("ACP_SESSION_ID")
+            os.environ["ACP_SESSION_ID"] = session_id
             try:
                 result = agent.run_conversation(
                     user_message=user_content,
@@ -1116,6 +1130,11 @@ class HermesACPAgent(acp.Agent):
                     os.environ.pop("HERMES_INTERACTIVE", None)
                 else:
                     os.environ["HERMES_INTERACTIVE"] = previous_interactive
+                # Restore ACP_SESSION_ID.
+                if previous_acp_sid is None:
+                    os.environ.pop("ACP_SESSION_ID", None)
+                else:
+                    os.environ["ACP_SESSION_ID"] = previous_acp_sid
                 if approval_cb:
                     try:
                         from tools import terminal_tool as _terminal_tool
@@ -1765,3 +1784,215 @@ class HermesACPAgent(acp.Agent):
         self.session_manager.save_session(session_id)
         logger.info("Session %s: config option %s updated", session_id, config_id)
         return SetSessionConfigOptionResponse(config_options=[])
+
+    # ---- Kanban completion watcher ------------------------------------------
+
+    async def _kanban_acp_watcher(self, interval: float = 5.0) -> None:
+        """Poll ``kanban_notify_subs`` and deliver terminal events to ACP sessions.
+
+        Mirrors the Gateway's ``_kanban_notifier_watcher`` but delivers to
+        ACP sessions instead of platform adapters.  Subscriptions with
+        ``platform="acp"`` are matched to the ACP session identified by
+        ``chat_id`` (which holds the ACP session_id).
+
+        On task completion (``completed``), also injects a synthetic
+        user message into the ACP session via ``conn.session_update`` so
+        the orchestrator (かえで) can review and dispatch the next phase
+        without manual intervention.
+        """
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            logger.warning("kanban acp watcher: kanban_db not importable; disabled")
+            return
+
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        MAX_SEND_FAILURES = 3
+        sub_fail_counts: dict[tuple, int] = {}
+
+        # Initial delay so the ACP connection can fully establish.
+        await asyncio.sleep(5)
+
+        while True:
+            try:
+                deliveries = await asyncio.to_thread(self._kanban_acp_collect, _kb, TERMINAL_KINDS)
+                if deliveries:
+                    for d in deliveries:
+                        await self._kanban_acp_deliver(d, sub_fail_counts, MAX_SEND_FAILURES)
+            except Exception:
+                logger.debug("kanban acp watcher: tick error", exc_info=True)
+            await asyncio.sleep(interval)
+
+    # -- collect (runs in thread) ---------------------------------------------
+
+    @staticmethod
+    def _kanban_acp_collect(_kb, terminal_kinds: tuple) -> list[dict]:
+        """Collect pending kanban events for ACP subscriptions (thread-safe)."""
+        deliveries: list[dict] = []
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+        seen_db_paths: set[str] = set()
+        for board_meta in boards:
+            slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+            db_path = board_meta.get("db_path")
+            try:
+                resolved = str(
+                    __import__("pathlib").Path(db_path).expanduser().resolve()
+                ) if db_path else str(_kb.kanban_db_path(slug).resolve())
+            except Exception:
+                resolved = f"slug:{slug}"
+            if resolved in seen_db_paths:
+                continue
+            seen_db_paths.add(resolved)
+            try:
+                conn = _kb.connect(board=slug)
+            except Exception:
+                continue
+            try:
+                subs = _kb.list_notify_subs(conn)
+                for sub in subs:
+                    # Only handle ACP-platform subscriptions
+                    if (sub.get("platform") or "").lower() != "acp":
+                        continue
+                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                        conn,
+                        task_id=sub["task_id"],
+                        platform=sub["platform"],
+                        chat_id=sub["chat_id"],
+                        thread_id=sub.get("thread_id") or "",
+                        kinds=terminal_kinds,
+                    )
+                    if not events:
+                        continue
+                    task = _kb.get_task(conn, sub["task_id"])
+                    deliveries.append({
+                        "sub": sub,
+                        "old_cursor": old_cursor,
+                        "cursor": cursor,
+                        "events": events,
+                        "task": task,
+                        "board": slug,
+                    })
+            finally:
+                conn.close()
+        return deliveries
+
+    # -- deliver (runs on event loop) ----------------------------------------
+
+    async def _kanban_acp_deliver(
+        self,
+        delivery: dict,
+        sub_fail_counts: dict[tuple, int],
+        max_failures: int,
+    ) -> None:
+        """Send a kanban notification to the ACP session and inject a prompt on completion."""
+        sub = delivery["sub"]
+        task = delivery["task"]
+        session_id = sub["chat_id"]  # For ACP subs, chat_id = ACP session_id
+        events = delivery["events"]
+        board_slug = delivery.get("board")
+        conn = self._conn
+
+        if not conn:
+            logger.debug("kanban acp watcher: no ACP connection; skipping")
+            return
+
+        # Check that the target session exists
+        state = self.session_manager.get_session(session_id)
+        if state is None:
+            logger.debug(
+                "kanban acp watcher: ACP session %s not found; skipping",
+                session_id,
+            )
+            return
+
+        title = (task.title if task else sub["task_id"])[:120]
+        tag = f"@{task.assignee} " if task and task.assignee else ""
+
+        for ev in events:
+            kind = ev.kind
+            if kind == "completed":
+                handoff = ""
+                payload_summary = None
+                if ev.payload and ev.payload.get("summary"):
+                    payload_summary = str(ev.payload["summary"])
+                if payload_summary:
+                    h = payload_summary.strip().splitlines()[0][:200]
+                    handoff = f"\n{h}"
+                elif task and task.result:
+                    r = task.result.strip().splitlines()[0][:160]
+                    handoff = f"\n{r}"
+                msg = f"✔ {tag}Kanban {sub['task_id']} done — {title}{handoff}"
+            elif kind == "blocked":
+                reason = ""
+                if ev.payload and ev.payload.get("reason"):
+                    reason = f": {str(ev.payload['reason'])[:160]}"
+                msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+            elif kind == "gave_up":
+                err = ""
+                if ev.payload and ev.payload.get("error"):
+                    err = f"\n{str(ev.payload['error'])[:200]}"
+                msg = f"✖ {tag}Kanban {sub['task_id']} gave up after repeated spawn failures{err}"
+            elif kind == "crashed":
+                msg = f"✖ {tag}Kanban {sub['task_id']} worker crashed (pid gone); dispatcher will retry"
+            elif kind == "timed_out":
+                limit = 0
+                if ev.payload and ev.payload.get("limit_seconds"):
+                    limit = int(ev.payload["limit_seconds"])
+                msg = f"⏱ {tag}Kanban {sub['task_id']} timed out (max_runtime={limit}s); will retry"
+            else:
+                continue
+
+            # Deliver as an ACP agent message to the session
+            sub_key = (
+                sub["task_id"], sub["platform"],
+                sub["chat_id"], sub.get("thread_id") or "",
+            )
+            try:
+                from acp.schema import AgentMessageChunk, TextContentBlock
+                update = AgentMessageChunk(
+                    session_update="agent_message_chunk",
+                    content=TextContentBlock(type="text", text=msg),
+                )
+                await conn.session_update(session_id=session_id, update=update)
+                logger.info(
+                    "kanban acp watcher: delivered %s event for %s to ACP session %s on board %s",
+                    kind, sub["task_id"], session_id, board_slug,
+                )
+
+                # On completion, also inject a steer prompt so the orchestrator
+                # can review and dispatch the next phase automatically.
+                if kind == "completed" and state and not state.is_running:
+                    inject_text = (
+                        f"📋 **Kanban task completed: {sub['task_id']}**\n"
+                        f"{msg}\n\n"
+                        f"Review the result and proceed with the next phase if ready."
+                    )
+                    inject_update = AgentMessageChunk(
+                        session_update="agent_message_chunk",
+                        content=TextContentBlock(type="text", text=inject_text),
+                    )
+                    await conn.session_update(session_id=session_id, update=inject_update)
+                    # Queue the steer so the next prompt cycle picks it up.
+                    state.queued_prompts.append(inject_text)
+                    logger.info(
+                        "kanban acp watcher: queued steer for %s in ACP session %s",
+                        sub["task_id"], session_id,
+                    )
+
+                sub_fail_counts.pop(sub_key, None)
+            except Exception as exc:
+                fails = sub_fail_counts.get(sub_key, 0) + 1
+                sub_fail_counts[sub_key] = fails
+                logger.warning(
+                    "kanban acp watcher: send failed for %s (%d/%d): %s",
+                    sub["task_id"], fails, max_failures, exc,
+                )
+                if fails >= max_failures:
+                    logger.warning(
+                        "kanban acp watcher: dropping sub for %s after %d failures",
+                        sub["task_id"], max_failures,
+                    )
+                    sub_fail_counts.pop(sub_key, None)

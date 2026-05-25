@@ -60,6 +60,7 @@ from agent.nous_rate_guard import (
     record_nous_rate_limit,
 )
 from agent.process_bootstrap import _install_safe_stdio
+from run_agent import _pool_may_recover_from_rate_limit
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad

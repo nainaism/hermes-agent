@@ -36,6 +36,121 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Session injection for kanban task completion
+# ---------------------------------------------------------------------------
+
+def _inject_completion_into_session(task_id: str, summary: str) -> None:
+    """Inject a synthetic completion notification into subscribed sessions.
+
+    When a kanban task completes, look up ``kanban_notify_subs`` for this
+    task and inject a ``MessageEvent(internal=True)`` into each subscribed
+    session's adapter via ``handle_message``. This lets the orchestrator
+    receive the notification in the *same conversation context* — no
+    manual intervention needed.
+
+    Falls back to the most-recent session if no subscriptions exist.
+    Uses the same pattern as ``_inject_watch_notification`` in gateway/run.py.
+    Runs as a no-op when the gateway runner ref is unavailable (e.g. CLI mode).
+    """
+    import asyncio
+    import sys
+
+    # Access the GatewayRunner via the module-level weak reference
+    gateway_run = sys.modules.get("gateway.run")
+    if gateway_run is None:
+        logger.debug("gateway.run not loaded — skipping session injection")
+        return
+
+    _gateway_runner_ref = getattr(gateway_run, "_gateway_runner_ref", lambda: None)
+    runner = _gateway_runner_ref()
+    if runner is None:
+        logger.debug("GatewayRunner ref stale/absent — skipping session injection")
+        return
+
+    # Collect target sessions from notify subscriptions
+    target_sources = []
+
+    # 1. Check kanban_notify_subs for this task
+    try:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect()
+        subs = _kb.list_notify_subs(conn)
+        conn.close()
+        for sub in subs:
+            if sub.get("task_id") != task_id:
+                continue
+            sub_plat = (sub.get("platform") or "").lower()
+            sub_chat = sub.get("chat_id", "")
+            # Match against active session sources
+            session_sources = getattr(runner, "_session_sources", {})
+            for _key, src in session_sources.items():
+                plat_val = src.platform.value if hasattr(src.platform, "value") else str(src.platform)
+                plat_val = plat_val.lower()
+                if plat_val == sub_plat and str(src.chat_id) == str(sub_chat):
+                    target_sources.append(src)
+                    break
+    except Exception:
+        logger.debug("notify_subs lookup failed", exc_info=True)
+
+    # 2. Fallback: use the most-recent session source
+    if not target_sources:
+        session_sources = getattr(runner, "_session_sources", {})
+        if session_sources:
+            latest = next(reversed(session_sources.values()))
+            if latest:
+                target_sources.append(latest)
+
+    if not target_sources:
+        logger.debug("No target sessions — skipping session injection")
+        return
+
+    # Build the synthetic message
+    text = (
+        f"📋 **Kanban task completed: {task_id}**\n"
+        f"Summary: {(summary or '(no summary)')[:300]}\n\n"
+        f"Review the result and proceed with the next phase if ready."
+    )
+
+    # Schedule the async injection on the gateway's event loop
+    try:
+        loop = getattr(runner, "_gateway_loop", None)
+        if loop is None:
+            loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.debug("No event loop — skipping session injection")
+        return
+
+    async def _do_inject():
+        try:
+            from gateway.platforms.base import MessageEvent, MessageType
+            for source in target_sources:
+                try:
+                    synth_event = MessageEvent(
+                        text=text,
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        internal=True,
+                    )
+                    adapter = runner.adapters.get(source.platform)
+                    if adapter:
+                        await adapter.handle_message(synth_event)
+                        logger.info(
+                            "Injected kanban completion for %s into session %s/%s",
+                            task_id,
+                            source.platform,
+                            source.chat_id,
+                        )
+                    else:
+                        logger.debug("No adapter for %s — skipping", source.platform)
+                except Exception:
+                    logger.debug("Injection failed for one target", exc_info=True)
+        except Exception:
+            logger.debug("Session injection coroutine failed", exc_info=True)
+
+    asyncio.ensure_future(_do_inject(), loop=loop)
+
+
+# ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
 
@@ -426,6 +541,26 @@ def _handle_complete(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
+            # Fire hook so external consumers (e.g. Paseo ACP session
+            # wake-up) can react to task completion.
+            try:
+                from hermes_cli.plugins import invoke_hook
+                invoke_hook(
+                    "kanban_task_completed",
+                    task_id=tid,
+                    summary=summary or result or "",
+                )
+            except Exception:
+                logger.debug("kanban_task_completed hook failed", exc_info=True)
+            # ── Session injection: notify the originating session ──
+            # Inject a synthetic MessageEvent into the active session so
+            # the orchestrator (かえで) can review and dispatch the next
+            # phase without manual intervention.  Uses the same pattern as
+            # ``_inject_watch_notification`` in gateway/run.py.
+            try:
+                _inject_completion_into_session(tid, summary or result or "")
+            except Exception:
+                logger.debug("kanban completion session injection failed", exc_info=True)
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
@@ -614,6 +749,20 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
             )
             new_task = kb.get_task(conn, new_tid)
+            # Auto-subscribe for ACP sessions so the kanban acp watcher
+            # delivers completion notifications back to the originating session.
+            acp_sid = os.environ.get("ACP_SESSION_ID")
+            if acp_sid:
+                try:
+                    kb.add_notify_sub(
+                        conn,
+                        task_id=new_tid,
+                        platform="acp",
+                        chat_id=acp_sid,
+                        notifier_profile=os.environ.get("HERMES_PROFILE") or "coo",
+                    )
+                except Exception:
+                    logger.debug("kanban_create: acp auto-subscribe failed", exc_info=True)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,

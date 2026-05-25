@@ -4474,6 +4474,46 @@ class GatewayRunner:
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
                             )
+                            # ── Session injection on task completion ──
+                            # After delivering the platform notification, also
+                            # inject a synthetic MessageEvent into the subscribed
+                            # session so the orchestrator can review and dispatch
+                            # the next phase without manual intervention.
+                            if kind == "completed" and sub.get("chat_id"):
+                                try:
+                                    from gateway.session import build_session_key
+                                    from gateway.platforms.base import MessageEvent, MessageType
+                                    # Find the session source matching this sub
+                                    inject_source = None
+                                    for _key, src in self._session_sources.items():
+                                        s_plat = src.platform.value if hasattr(src.platform, "value") else str(src.platform)
+                                        if s_plat.lower() == platform_str and str(src.chat_id) == str(sub["chat_id"]):
+                                            inject_source = src
+                                            break
+                                    if inject_source is not None:
+                                        inject_text = (
+                                            f"📋 **Kanban task completed: {sub['task_id']}**\n"
+                                            f"{msg}\n\n"
+                                            f"Review the result and proceed with the next phase if ready."
+                                        )
+                                        synth_event = MessageEvent(
+                                            text=inject_text,
+                                            message_type=MessageType.TEXT,
+                                            source=inject_source,
+                                            internal=True,
+                                        )
+                                        await adapter.handle_message(synth_event)
+                                        logger.info(
+                                            "kanban notifier: injected completion for %s into session %s/%s",
+                                            sub["task_id"], platform_str, sub["chat_id"],
+                                        )
+                                    else:
+                                        logger.debug(
+                                            "kanban notifier: no session source for %s/%s — injection skipped",
+                                            platform_str, sub["chat_id"],
+                                        )
+                                except Exception:
+                                    logger.debug("kanban session injection failed", exc_info=True)
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
