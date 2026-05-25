@@ -1962,24 +1962,21 @@ class HermesACPAgent(acp.Agent):
                     kind, sub["task_id"], session_id, board_slug,
                 )
 
-                # On completion, also inject a steer prompt so the orchestrator
+                # On completion, wake the idle ACP session so the orchestrator
                 # can review and dispatch the next phase automatically.
                 if kind == "completed" and state and not state.is_running:
-                    inject_text = (
+                    wake_text = (
                         f"📋 **Kanban task completed: {sub['task_id']}**\n"
                         f"{msg}\n\n"
                         f"Review the result and proceed with the next phase if ready."
                     )
-                    inject_update = AgentMessageChunk(
-                        session_update="agent_message_chunk",
-                        content=TextContentBlock(type="text", text=inject_text),
-                    )
-                    await conn.session_update(session_id=session_id, update=inject_update)
-                    # Queue the steer so the next prompt cycle picks it up.
-                    state.queued_prompts.append(inject_text)
                     logger.info(
-                        "kanban acp watcher: queued steer for %s in ACP session %s",
-                        sub["task_id"], session_id,
+                        "kanban acp watcher: waking ACP session %s for %s",
+                        session_id, sub["task_id"],
+                    )
+                    await self.prompt(
+                        prompt=[TextContentBlock(type="text", text=wake_text)],
+                        session_id=session_id,
                     )
 
                 sub_fail_counts.pop(sub_key, None)
