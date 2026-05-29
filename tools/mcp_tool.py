@@ -399,6 +399,17 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
             candidates = [
                 os.path.join(hermes_home, "node", "bin", resolved_command),
                 os.path.join(os.path.expanduser("~"), ".local", "bin", resolved_command),
+                # /usr/local/bin is the canonical install location for Node on
+                # Linux from-source builds, the upstream node:bookworm-slim
+                # image (which the Hermes Docker image copies node + npm +
+                # corepack from since #4977), and macOS Homebrew on Intel.
+                # Without this candidate, any MCP server configured with an
+                # env.PATH that omits /usr/local/bin (a common pattern when
+                # users hand-author PATH for sandboxing) fails with ENOENT
+                # at execvp, and a naive symlink workaround into the user's
+                # PATH only fails one layer deeper because npx's shebang
+                # re-execs /usr/bin/env node which needs the same directory.
+                os.path.join(os.sep, "usr", "local", "bin", resolved_command),
             ]
             for candidate in candidates:
                 if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
@@ -534,6 +545,79 @@ def _validate_remote_mcp_url(server_name: str, url: Any) -> str:
             f"({stripped!r})"
         )
     return stripped
+
+
+def _resolve_client_cert(server_name: str, config: dict):
+    """Resolve the ``client_cert`` / ``client_key`` config for mTLS.
+
+    Returns whatever ``httpx``'s ``cert=`` parameter accepts, or ``None`` when
+    no client certificate is configured:
+
+      - ``None`` if neither ``client_cert`` nor ``client_key`` is set.
+      - A single absolute path string if ``client_cert`` is a string and
+        ``client_key`` is unset (PEM file with cert + key combined).
+      - A ``(cert_path, key_path)`` tuple when both are set, or when
+        ``client_cert`` is a 2-element list/tuple.
+      - A ``(cert_path, key_path, password)`` tuple when ``client_cert`` is
+        a 3-element list/tuple — the third element is the key passphrase.
+
+    User paths support ``~`` expansion. Missing files raise ``FileNotFoundError``
+    with a server-scoped message so the failure surfaces as a clear setup
+    error rather than an opaque TLS handshake error.
+    """
+    raw_cert = config.get("client_cert")
+    raw_key = config.get("client_key")
+
+    if raw_cert is None and raw_key is None:
+        return None
+
+    def _expand(path: Any, label: str) -> str:
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError(
+                f"MCP server '{server_name}': {label} must be a non-empty "
+                f"string path (got {type(path).__name__})"
+            )
+        expanded = os.path.expanduser(path.strip())
+        if not os.path.isfile(expanded):
+            raise FileNotFoundError(
+                f"MCP server '{server_name}': {label} not found at "
+                f"{expanded!r}"
+            )
+        return expanded
+
+    # Tuple/list form for client_cert — (cert, key) or (cert, key, password).
+    if isinstance(raw_cert, (list, tuple)):
+        if raw_key is not None:
+            raise ValueError(
+                f"MCP server '{server_name}': specify either client_cert as "
+                f"a list [cert, key] OR client_cert + client_key, not both"
+            )
+        if len(raw_cert) == 2:
+            cert_path = _expand(raw_cert[0], "client_cert[0]")
+            key_path = _expand(raw_cert[1], "client_cert[1]")
+            return (cert_path, key_path)
+        if len(raw_cert) == 3:
+            cert_path = _expand(raw_cert[0], "client_cert[0]")
+            key_path = _expand(raw_cert[1], "client_cert[1]")
+            password = raw_cert[2]
+            if not isinstance(password, str):
+                raise ValueError(
+                    f"MCP server '{server_name}': client_cert[2] (key "
+                    f"passphrase) must be a string"
+                )
+            return (cert_path, key_path, password)
+        raise ValueError(
+            f"MCP server '{server_name}': client_cert list form must have 2 "
+            f"or 3 elements (got {len(raw_cert)})"
+        )
+
+    # String form for client_cert.
+    cert_path = _expand(raw_cert, "client_cert")
+    if raw_key is not None:
+        key_path = _expand(raw_key, "client_key")
+        return (cert_path, key_path)
+    # Single combined PEM file (cert + key in one file).
+    return cert_path
 
 
 def _format_connect_error(exc: BaseException) -> str:
@@ -1196,6 +1280,15 @@ class MCPServerTask:
 
     async def _run_stdio(self, config: dict):
         """Run the server using stdio transport."""
+        if not _MCP_AVAILABLE:
+            raise ImportError(
+                f"MCP server '{self.name}' requires the 'mcp' Python SDK, but "
+                "it is not installed. Install with:\n"
+                "  pip install 'hermes-agent[mcp]'\n"
+                "or (full install):\n"
+                "  pip install 'hermes-agent[all]'"
+            )
+
         command = config.get("command")
         args = config.get("args", [])
         user_env = config.get("env")
@@ -1294,6 +1387,7 @@ class MCPServerTask:
             headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
+        client_cert = _resolve_client_cert(self.name, config)
 
         # OAuth 2.1 PKCE: route through the central MCPOAuthManager so the
         # same provider instance is reused across reconnects, pre-flow
@@ -1315,6 +1409,82 @@ class MCPServerTask:
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
             sampling_kwargs["message_handler"] = self._make_message_handler()
+
+        # SSE transport (for MCP servers that implement the SSE transport protocol
+        # rather than Streamable HTTP). Configure with ``transport: sse`` in the
+        # mcp_servers entry in config.yaml.
+        if config.get("transport") == "sse":
+            if sse_client is None:
+                raise ImportError(
+                    f"MCP server '{self.name}' requires SSE transport but "
+                    "mcp.client.sse.sse_client is not available. "
+                    "Upgrade the mcp package to get SSE support."
+                )
+            # sse_read_timeout governs how long sse_client will wait between
+            # events on the SSE stream. Using the tool_timeout (default 60s)
+            # here is wrong: SSE servers commonly hold the stream idle for
+            # minutes between events, so a 60s read timeout drops the
+            # connection after the first slow stretch. 300s matches the
+            # Streamable HTTP code path's httpx read timeout below. Original
+            # observation from @amiller in PR #5981 (Router Teamwork,
+            # Supermemory on Cloudflare Workers idle-disconnect at ~60s).
+            _sse_kwargs: dict = {
+                "url": url,
+                "headers": headers or None,
+                "timeout": float(connect_timeout),
+                "sse_read_timeout": 300.0,
+            }
+            if _oauth_auth is not None:
+                # Pass OAuth auth through to sse_client so SSE MCP servers
+                # behind OAuth 2.1 PKCE work. Previously built but never
+                # forwarded — SSE OAuth would silently fail with 401s.
+                _sse_kwargs["auth"] = _oauth_auth
+            if client_cert is not None or ssl_verify is not True:
+                # SSE transport doesn't expose verify/cert as kwargs, so route
+                # them through an httpx_client_factory that wraps the SDK's
+                # defaults (follow_redirects=True) and adds our TLS settings.
+                # The SDK calls the factory with (headers, auth, timeout); we
+                # forward all of those and layer verify/cert on top.
+                import httpx as _httpx_mod
+
+                _cert_for_factory = client_cert
+                _verify_for_factory = ssl_verify
+
+                def _mcp_http_client_factory(
+                    headers=None, timeout=None, auth=None,
+                ):
+                    kwargs: dict = {
+                        "follow_redirects": True,
+                        "verify": _verify_for_factory,
+                    }
+                    if timeout is not None:
+                        kwargs["timeout"] = timeout
+                    else:
+                        kwargs["timeout"] = _httpx_mod.Timeout(30.0, read=300.0)
+                    if headers is not None:
+                        kwargs["headers"] = headers
+                    if auth is not None:
+                        kwargs["auth"] = auth
+                    if _cert_for_factory is not None:
+                        kwargs["cert"] = _cert_for_factory
+                    return _httpx_mod.AsyncClient(**kwargs)
+
+                _sse_kwargs["httpx_client_factory"] = _mcp_http_client_factory
+            async with sse_client(**_sse_kwargs) as (read_stream, write_stream):
+                async with ClientSession(
+                    read_stream, write_stream, **sampling_kwargs
+                ) as session:
+                    self.initialize_result = await session.initialize()
+                    self.session = session
+                    await self._discover_tools()
+                    self._ready.set()
+                    reason = await self._wait_for_lifecycle_event()
+                    if reason == "reconnect":
+                        logger.info(
+                            "MCP server '%s': reconnect requested — "
+                            "tearing down SSE session", self.name,
+                        )
+            return
 
         if _MCP_NEW_HTTP:
             # New API (mcp >= 1.24.0): build an explicit httpx.AsyncClient
@@ -1343,6 +1513,8 @@ class MCPServerTask:
                 client_kwargs["headers"] = headers
             if _oauth_auth is not None:
                 client_kwargs["auth"] = _oauth_auth
+            if client_cert is not None:
+                client_kwargs["cert"] = client_cert
 
             # Caller owns the client lifecycle — the SDK skips cleanup when
             # http_client is provided, so we wrap in async-with.

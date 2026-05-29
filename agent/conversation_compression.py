@@ -34,11 +34,31 @@ import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
+
+
+def _compression_lock_holder(agent: Any) -> str:
+    """Build a unique holder id for the lock: pid:tid:agent-instance:uuid.
+
+    The pid+tid prefix lets ops tell crashed/abandoned holders apart from
+    live ones (expiry-based recovery uses the timestamp, but ``holder``
+    is what shows up in diagnostics + log lines). The agent instance id
+    and a per-acquire uuid disambiguate two co-resident agents on the
+    same thread (background_review forks run on a worker thread, but
+    on machines where compression itself dispatches to a thread pool
+    we want each acquire to be unique).
+    """
+    import threading
+    return (
+        f"pid={os.getpid()}"
+        f":tid={threading.get_ident()}"
+        f":agent={id(agent):x}"
+        f":nonce={uuid.uuid4().hex[:8]}"
+    )
 
 
 def check_compression_model_feasibility(agent: Any) -> None:
@@ -103,7 +123,15 @@ def check_compression_model_feasibility(agent: Any) -> None:
             return
 
         aux_base_url = str(getattr(client, "base_url", ""))
-        aux_api_key = str(getattr(client, "api_key", ""))
+        # ``client.api_key`` may be a callable (Azure Foundry Entra ID
+        # bearer provider). The context-length resolver chain expects a
+        # string, but it only needs a key for live catalogue probes
+        # (provider model lists). For Entra clients the model-metadata
+        # chain still resolves via models.dev + hardcoded family
+        # fallbacks, which don't require auth — pass empty string rather
+        # than minting a bearer JWT just to look up a context length.
+        _raw_aux_key = getattr(client, "api_key", "")
+        aux_api_key = "" if (callable(_raw_aux_key) and not isinstance(_raw_aux_key, str)) else str(_raw_aux_key or "")
 
         aux_context = get_model_context_length(
             aux_model,
@@ -248,6 +276,7 @@ def compress_context(
     approx_tokens: Optional[int] = None,
     task_id: str = "default",
     focus_topic: Optional[str] = None,
+    force: bool = False,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -260,10 +289,31 @@ def compress_context(
         focus_topic: Optional focus string for guided compression — the
             summariser will prioritise preserving information related to
             this topic.  Inspired by Claude Code's ``/compact <focus>``.
+        force: If True, bypass any active summary-failure cooldown.  Set
+            by the manual ``/compress`` slash command so users can retry
+            immediately after an auto-compress abort.  Auto-compress
+            callers use the default ``False``.
 
     Returns:
-        ``(compressed_messages, new_system_prompt)`` tuple.
+        ``(compressed_messages, new_system_prompt)`` tuple.  When
+        compression aborts (aux LLM failed to produce a usable summary),
+        returns the original messages unchanged and the existing system
+        prompt — the session is NOT rotated.  Callers should detect the
+        no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    # Lazy feasibility check — run the auxiliary-provider probe + context
+    # length lookup just-in-time on the first compression attempt instead of
+    # at AIAgent.__init__. Saves ~400ms cold off every short session that
+    # never reaches the threshold (the vast majority of ``chat -q`` runs).
+    # The check itself sets ``agent._compression_warning`` so the
+    # status-callback replay machinery still emits the warning to the user
+    # the first time it would matter.
+    if not getattr(agent, "_compression_feasibility_checked", True):
+        try:
+            check_compression_model_feasibility(agent)
+        finally:
+            agent._compression_feasibility_checked = True
+
     _pre_msg_count = len(messages)
     logger.info(
         "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
@@ -275,6 +325,65 @@ def compress_context(
         "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
     )
 
+    # ── Compression lock ────────────────────────────────────────────────
+    # Atomic, state.db-backed lock per session_id.  Without this, two
+    # AIAgent instances that share the same session_id (most commonly the
+    # parent-turn agent and its background-review fork — see
+    # ``agent/background_review.py``: ``review_agent.session_id =
+    # agent.session_id``) can each call compress() on overlapping
+    # snapshots of the same conversation.  Both succeed, both rotate
+    # ``agent.session_id`` to a fresh id, both create child sessions in
+    # state.db parented to the same old id.  The gateway's SessionEntry
+    # only catches one rotation, so the other child becomes an orphan
+    # that silently accumulates writes — Damien's repro shape.
+    #
+    # Acquire keyed on the OLD session_id (the rotation target's parent),
+    # because that's the id that competing paths see and read from
+    # SessionEntry at the start of their own compression attempt.
+    #
+    # If we can't acquire the lock, another path is mid-compression on
+    # this session.  Aborting is correct: the messages are unchanged, the
+    # other path's rotation will produce the canonical new session_id,
+    # and our caller's auto-compress loop sees ``len(returned) == len(input)``
+    # and stops retrying for this cycle. The session is NOT corrupted —
+    # we just sit out this round and let the winner finish.
+    _lock_db = getattr(agent, "_session_db", None)
+    _lock_sid = agent.session_id or ""
+    _lock_holder: Optional[str] = None
+    if _lock_db is not None and _lock_sid:
+        _lock_holder = _compression_lock_holder(agent)
+        if not _lock_db.try_acquire_compression_lock(_lock_sid, _lock_holder):
+            existing = _lock_db.get_compression_lock_holder(_lock_sid)
+            logger.warning(
+                "compression skipped: another path is compressing session=%s "
+                "(holder=%s) — returning messages unchanged to avoid session fork",
+                _lock_sid, existing,
+            )
+            _lock_holder = None  # don't release a lock we don't own
+            # Surface to the user once — quiet for downstream auto-compress loops
+            if getattr(agent, "_last_compression_lock_warning_sid", None) != _lock_sid:
+                agent._last_compression_lock_warning_sid = _lock_sid
+                try:
+                    agent._emit_warning(
+                        "⚠ Skipping concurrent compression — another path "
+                        "is already compressing this session. Will retry "
+                        "after it finishes."
+                    )
+                except Exception:
+                    pass
+            _existing_sp = getattr(agent, "_cached_system_prompt", None)
+            if not _existing_sp:
+                _existing_sp = agent._build_system_prompt(system_message)
+            return messages, _existing_sp
+
+    def _release_lock() -> None:
+        """Release the lock keyed on the OLD session_id (before rotation)."""
+        if _lock_db is not None and _lock_sid and _lock_holder:
+            try:
+                _lock_db.release_compression_lock(_lock_sid, _lock_holder)
+            except Exception as _rel_err:
+                logger.debug("compression lock release failed: %s", _rel_err)
+
     # Notify external memory provider before compression discards context
     if agent._memory_manager:
         try:
@@ -283,11 +392,36 @@ def compress_context(
             pass
 
     try:
-        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
+        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
     except TypeError:
         # Plugin context engine with strict signature that doesn't accept
-        # focus_topic — fall back to calling without it.
+        # focus_topic / force — fall back to calling without them.
         compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens)
+    except BaseException:
+        # ANY exception during compress() must release the lock so the
+        # session isn't permanently blocked from future compression.
+        _release_lock()
+        raise
+
+    # If compression aborted (aux LLM failed to produce a usable summary)
+    # the compressor returns the input messages unchanged.  Surface the
+    # error to the user, skip the session-rotation work entirely (no
+    # session has logically ended), and let auto-compress callers detect
+    # the no-op via len(returned) == len(input).
+    if getattr(agent.context_compressor, "_last_compress_aborted", False):
+        _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
+        if getattr(agent, "_last_compression_summary_warning", None) != _err:
+            agent._last_compression_summary_warning = _err
+            agent._emit_warning(
+                f"⚠ Compression aborted: {_err}. "
+                "No messages were dropped — conversation continues unchanged. "
+                "Run /compress to retry, or /new to start a fresh session."
+            )
+        _existing_sp = getattr(agent, "_cached_system_prompt", None)
+        if not _existing_sp:
+            _existing_sp = agent._build_system_prompt(system_message)
+        _release_lock()  # compression aborted — no rotation will happen
+        return messages, _existing_sp
 
     summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
     if summary_error:
@@ -332,14 +466,12 @@ def compress_context(
             agent._session_db.end_session(agent.session_id, "compression")
             old_session_id = agent.session_id
             agent.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-            os.environ["HERMES_SESSION_ID"] = agent.session_id
             try:
-                from gateway.session_context import _SESSION_ID
-                _SESSION_ID.set(agent.session_id)
+                from gateway.session_context import set_current_session_id
+
+                set_current_session_id(agent.session_id)
             except Exception:
-                pass
-            # Update session_log_file to point to the new session's JSON file
-            agent.session_log_file = agent.logs_dir / f"session_{agent.session_id}.json"
+                os.environ["HERMES_SESSION_ID"] = agent.session_id
             agent._session_db_created = False
             agent._session_db.create_session(
                 session_id=agent.session_id,
@@ -374,6 +506,7 @@ def compress_context(
                 agent.session_id or "",
                 boundary_reason="compression",
                 old_session_id=_old_sid,
+                conversation_id=getattr(agent, "_gateway_session_key", None),
             )
     except Exception as _ce_err:
         logger.debug("context engine on_session_start (compression): %s", _ce_err)
@@ -432,6 +565,12 @@ def compress_context(
         agent.session_id or "none", _pre_msg_count, len(compressed),
         f"{_compressed_est:,}",
     )
+    # Release the lock on the OLD session_id only AFTER rotation completed
+    # and all post-rotation bookkeeping (memory manager, context engine,
+    # file dedup) ran. A concurrent path that wakes up the moment we
+    # release will see the NEW session_id in state.db / SessionEntry and
+    # acquire on that — no race against our just-finished work.
+    _release_lock()
     return compressed, new_system_prompt
 
 
