@@ -171,3 +171,142 @@ def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
     assert agent.session_id == parent_sid
     # Compressor was never called (the skip happens before .compress())
     agent.context_compressor.compress.assert_not_called()
+
+
+class _NoLockSubsystemDB:
+    """Wraps a real SessionDB but simulates a pre-#34351 version skew.
+
+    A long-lived process can hold ``hermes_state.SessionDB`` bound to the
+    OLD class in memory (no compression-lock methods) while a lazily
+    re-imported ``conversation_compression.py`` calls the NEW lock code.
+    ``try_acquire_compression_lock`` then raises ``AttributeError`` — which
+    is NOT a ``sqlite3.Error``, so the method's own fail-open guard never
+    runs.  Before the fix the exception propagated to the outer agent loop,
+    which printed the error and retried; compression never succeeded, the
+    token count never dropped, and the loop re-triggered compaction forever.
+    """
+
+    def __init__(self, real_db: SessionDB) -> None:
+        self._real = real_db
+
+    def try_acquire_compression_lock(self, *_a, **_k):  # noqa: D401
+        raise AttributeError(
+            "'SessionDB' object has no attribute 'try_acquire_compression_lock'"
+        )
+
+    def get_compression_lock_holder(self, *_a, **_k):
+        raise AttributeError("'SessionDB' object has no attribute 'get_compression_lock_holder'")
+
+    def release_compression_lock(self, *_a, **_k):
+        raise AttributeError("'SessionDB' object has no attribute 'release_compression_lock'")
+
+    def __getattr__(self, name):
+        # Everything else (create_session, append, rotation helpers) goes to
+        # the real db so the post-lock compression + rotation path runs.
+        return getattr(self._real, name)
+
+
+def test_missing_lock_subsystem_fails_open_not_infinite_loop(tmp_path: Path) -> None:
+    """Version skew (no lock methods) must fail OPEN, not raise into the loop.
+
+    Reproduces the "API call #47/#48/#49 ... has no attribute
+    try_acquire_compression_lock" infinite-compaction spin: when the lock
+    subsystem is absent, ``_compress_context`` must skip locking and proceed
+    with compression (so the loop makes progress and terminates) instead of
+    letting the ``AttributeError`` escape to the retry loop.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "SKEW_TEST_SESSION"
+    db.create_session(parent_sid, source="discord")
+
+    agent = _build_agent_with_db(db, parent_sid)
+    # Swap in the lock-less wrapper AFTER construction (the agent already
+    # holds a normal db reference; we only break the lock methods).
+    agent._session_db = _NoLockSubsystemDB(db)
+
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+    # MUST NOT raise AttributeError. Before the fix this raised and the
+    # outer loop would retry forever.
+    compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+    # Compression actually ran (proceeded past the broken lock) and made
+    # progress, so the auto-compress loop would terminate.
+    agent.context_compressor.compress.assert_called_once()
+    assert len(compressed) < len(messages), (
+        "Compression made no progress despite failing open — loop would still spin."
+    )
+    # Session rotated (compression succeeded end-to-end).
+    assert agent.session_id != parent_sid
+
+
+def test_review_fork_disables_compression_to_prevent_stale_parent_fork() -> None:
+    """The background-review fork must set ``compression_enabled = False``
+    so it can never compress the parent it shares a session_id with
+    (issue #38727).
+
+    The per-session compression lock only serialises a SAME-WINDOW concurrent
+    race. It does NOT stop a stale parent from being compressed again in a
+    LATER turn: if ``review_agent`` had won the race, its new child session is
+    never adopted by the gateway (the fork is single-lifecycle and dies right
+    after one ``run_conversation``), so the foreground path would start the
+    next turn from the stale parent and compress it AGAIN — leaving the same
+    parent with two sibling children.
+
+    The fix makes the review fork never trigger compression at all. Both
+    compression trigger sites in ``agent/conversation_loop.py`` gate on
+    ``agent.compression_enabled`` BEFORE calling ``_compress_context``:
+      • preflight (``if agent.compression_enabled and len(messages) > ...``)
+      • mid-loop  (``if agent.compression_enabled and _compressor.should_compress(...)``)
+    so a fork with the flag cleared never reaches the rotation path.
+
+    This test pins the contract at the source: ``_run_review_in_thread``
+    must set ``review_agent.compression_enabled = False`` on the fork it
+    builds. It calls the real worker synchronously with
+    ``AIAgent.run_conversation`` patched (so no LLM call happens) and
+    captures the constructed review agent to assert the flag.
+    """
+    import tempfile
+
+    import agent.background_review as br
+
+    captured = {}
+
+    def _fake_run_conversation(self, *_a, **_k):
+        captured["compression_enabled"] = self.compression_enabled
+        captured["session_id"] = self.session_id
+        return {"final_response": "", "messages": []}
+
+    parent_sid = "REVIEW_FORK_FLAG_TEST"
+
+    with tempfile.TemporaryDirectory() as td:
+        db = SessionDB(db_path=Path(td) / "state.db")
+        db.create_session(parent_sid, source="discord")
+        parent = _build_agent_with_db(db, parent_sid)
+
+        # The worker does a local ``from run_agent import AIAgent``; patching
+        # the class method covers that import path.
+        from run_agent import AIAgent
+
+        with patch.object(AIAgent, "run_conversation", _fake_run_conversation):
+            br._run_review_in_thread(
+                parent,
+                [{"role": "user", "content": "hi"}],
+                "review this conversation",
+            )
+
+    assert captured, (
+        "_run_review_in_thread never reached run_conversation — the spawn path "
+        "changed; update this test to capture the review AIAgent."
+    )
+    assert captured["session_id"] == parent_sid, (
+        "Review fork should inherit the parent's session_id (shared id is the "
+        "whole reason compression must be disabled)."
+    )
+    assert captured["compression_enabled"] is False, (
+        "FIX REGRESSION: background-review fork did NOT disable compression. "
+        "It shares the parent's session_id, so an enabled fork can rotate the "
+        "parent into an orphan child (issue #38727). The trigger gates in "
+        "conversation_loop.py only short-circuit when compression_enabled is "
+        "False — this flag MUST be cleared on the review fork."
+    )
