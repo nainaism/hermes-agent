@@ -43,6 +43,8 @@ from acp.schema import (
     SetSessionModeResponse,
     ResourceContentBlock,
     SessionCapabilities,
+    SessionConfigOptionSelect,
+    SessionConfigSelectOption,
     SessionForkCapabilities,
     SessionInfoUpdate,
     SessionListCapabilities,
@@ -236,6 +238,11 @@ class HermesACPAgent(acp.Agent):
     _EDIT_APPROVAL_POLICY_CONFIG_ID = "edit_approval_policy"
     _EDIT_APPROVAL_POLICY_DEFAULT = "ask"
     _MODE_DEFAULT = "default"
+
+    # Thought-level (reasoning) config option
+    _THOUGHT_LEVEL_CONFIG_ID = "thought_level"
+    _THOUGHT_LEVEL_OPTIONS = ("off", "low", "medium", "high", "max")
+    _THOUGHT_LEVEL_DEFAULT = "medium"
     _MODE_ACCEPT_EDITS = "accept_edits"
     _MODE_DONT_ASK = "dont_ask"
     _MODE_TO_EDIT_APPROVAL_POLICY = {
@@ -252,21 +259,45 @@ class HermesACPAgent(acp.Agent):
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
 
-    # ---- Connection lifecycle -----------------------------------------------
+        # Start background watchers early so they run regardless of
+        # whether on_connect is called (Paseo ACP connections may not
+        # trigger on_connect, but sessions are still created).
+        self._watcher_started = False
 
-    def on_connect(self, conn: acp.Client) -> None:
-        """Store the client connection and start the kanban watcher."""
-        self._conn = conn
-        logger.info("ACP client connected")
+    def _ensure_watchers_started(self) -> None:
+        """Start background watchers if not already running."""
+        if self._watcher_started:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("No running event loop — watchers not started")
+            return
+        self._watcher_started = True
 
         # Start the kanban completion watcher so ACP sessions receive
         # notifications when subscribed kanban tasks reach a terminal state.
         try:
-            loop = asyncio.get_running_loop()
             loop.create_task(self._kanban_acp_watcher())
             logger.info("Kanban ACP watcher started")
-        except RuntimeError:
-            logger.warning("No running event loop — kanban watcher not started")
+        except Exception:
+            logger.warning("Failed to start kanban ACP watcher", exc_info=True)
+
+        # Start the Codex goal watcher so ACP sessions receive
+        # notifications when a dispatched Codex /goal completes.
+        try:
+            loop.create_task(self._codex_goal_watcher())
+            logger.info("Codex goal watcher started")
+        except Exception:
+            logger.warning("Failed to start Codex goal watcher", exc_info=True)
+
+    # ---- Connection lifecycle -----------------------------------------------
+
+    def on_connect(self, conn: acp.Client) -> None:
+        """Store the client connection and start watchers."""
+        self._conn = conn
+        logger.info("ACP client connected")
+        self._ensure_watchers_started()
 
     def _session_modes(self, state: SessionState) -> SessionModeState:
         """Return ACP session modes while preserving Zed's separate model picker.
@@ -378,6 +409,46 @@ class HermesACPAgent(acp.Agent):
             available_models=[ModelInfo(model_id=fallback_choice, name=model)],
             current_model_id=fallback_choice,
         )
+
+    def _build_thought_level_config(self, state: SessionState) -> list:
+        """Return ACP config_options for reasoning/thought-level control.
+
+        Paseo renders a SelectOption selector when config_options is non-empty.
+        The current value is derived from the agent's reasoning_config, falling
+        back to the configured default.
+        """
+        try:
+            agent = getattr(state, "agent", None)
+            rc = getattr(agent, "reasoning_config", None)
+            if rc and isinstance(rc, dict):
+                if not rc.get("enabled", True):
+                    current = "off"
+                else:
+                    effort = rc.get("effort", self._THOUGHT_LEVEL_DEFAULT)
+                    current = effort if effort in self._THOUGHT_LEVEL_OPTIONS else self._THOUGHT_LEVEL_DEFAULT
+            else:
+                current = self._THOUGHT_LEVEL_DEFAULT
+
+            return [
+                SessionConfigOptionSelect(
+                    id=self._THOUGHT_LEVEL_CONFIG_ID,
+                    name="Thinking",
+                    description="Reasoning effort level",
+                    category="thought_level",
+                    type="select",
+                    currentValue=current,
+                    options=[
+                        SessionConfigSelectOption(name="Off", value="off"),
+                        SessionConfigSelectOption(name="Low", value="low"),
+                        SessionConfigSelectOption(name="Medium", value="medium"),
+                        SessionConfigSelectOption(name="High", value="high"),
+                        SessionConfigSelectOption(name="Max", value="max"),
+                    ],
+                ),
+            ]
+        except Exception:
+            logger.debug("Could not build thought-level config", exc_info=True)
+            return []
 
     @staticmethod
     def _resolve_model_selection(raw_model: str, current_provider: str) -> tuple[str, str]:
@@ -836,11 +907,13 @@ class HermesACPAgent(acp.Agent):
         state = self.session_manager.create_session(cwd=cwd)
         await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("New session %s (cwd=%s)", state.session_id, cwd)
+        self._ensure_watchers_started()
         self._schedule_available_commands_update(state.session_id)
         return NewSessionResponse(
             session_id=state.session_id,
             models=self._build_model_state(state),
             modes=self._session_modes(state),
+            configOptions=self._build_thought_level_config(state),
         )
 
     async def load_session(
@@ -891,6 +964,7 @@ class HermesACPAgent(acp.Agent):
         return LoadSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
+            configOptions=self._build_thought_level_config(state),
         )
 
     # ---- History replay ----------------------------------------------------
@@ -992,6 +1066,7 @@ class HermesACPAgent(acp.Agent):
             state = self.session_manager.create_session(cwd=cwd)
         await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("Resumed session %s", state.session_id)
+        self._ensure_watchers_started()
         # See `load_session` above for the spec rationale — replay must
         # complete before the response so clients receive the full transcript
         # within the request's lifetime.
@@ -1781,45 +1856,41 @@ class HermesACPAgent(acp.Agent):
         )
 
     def _cmd_goal(self, args: str, state: SessionState) -> str:
-        """GoalManager integration — same as CLI/Gateway."""
+        """Dispatch /goal to Codex via Paseo WebSocket.
+
+        Overrides the default GoalManager for ACP sessions — sends the
+        goal to a new Codex agent and returns immediately. The codex goal
+        watcher polls for completion and wakes the idle session.
+        """
+        if not args.strip():
+            return (
+                "Usage: /goal <prompt>\n"
+                "Dispatches the goal to Codex via Paseo. "
+                "Results are delivered back when Codex finishes."
+            )
+
         try:
-            from hermes_cli.goals import GoalManager
-        except ImportError:
-            return "Goals module not available."
+            cwd = getattr(state, "cwd", None) or os.getcwd()
+            result = self.codex_goal_dispatch(
+                goal_prompt=args.strip(),
+                session_id=state.session_id,
+                cwd=cwd,
+            )
+        except Exception as exc:
+            logger.warning("goal dispatch failed: %s", exc)
+            return f"Failed to dispatch goal to Codex: {exc}"
 
-        mgr = GoalManager(session_id=state.session_id, default_max_turns=20)
-        lower = (args or "").strip().lower()
-
-        if not args.strip() or lower == "status":
-            return mgr.status_line()
-
-        if lower == "pause":
-            s = mgr.pause(reason="user-paused")
-            return f"\u23f8 Goal paused: {s.goal}" if s else "No goal set."
-
-        if lower == "resume":
-            s = mgr.resume()
-            if s is None:
-                return "No goal to resume."
-            with state.runtime_lock:
-                state.queued_prompts.append(s.goal)
-            return f"\u25b6 Goal resumed: {s.goal}"
-
-        if lower in ("clear", "stop", "done"):
-            had = mgr.has_goal()
-            mgr.clear()
-            return "\u2713 Goal cleared." if had else "No active goal."
-
-        # Set new goal
-        try:
-            s = mgr.set(args.strip())
-        except ValueError as e:
-            return f"Invalid goal: {e}"
-
-        # Queue the goal as first turn
-        with state.runtime_lock:
-            state.queued_prompts.append(s.goal)
-        return f"\u2299 Goal set ({s.max_turns}-turn budget): {s.goal}"
+        if result.get("status") == "dispatched":
+            agent_id = result.get("paseo_agent_id", "unknown")[:12]
+            return (
+                f"⤵ Goal dispatched to Codex (agent {agent_id}...)\n"
+                f"The session will wake automatically when it completes."
+            )
+        else:
+            return (
+                f"Failed to dispatch goal: {result.get('error', 'unknown')}\n"
+                "Falling back to local GoalManager."
+            )
 
     def _cmd_resume(self, args: str, state: SessionState) -> str:
         """Search for sessions to resume."""
@@ -1884,11 +1955,11 @@ class HermesACPAgent(acp.Agent):
             if hasattr(agent, "reasoning_config"):
                 agent.reasoning_config = {"enabled": False}
             return "Reasoning disabled."
-        if lower in ("low", "medium", "high"):
+        if lower in ("low", "medium", "high", "max"):
             if hasattr(agent, "reasoning_config"):
                 agent.reasoning_config = {"enabled": True, "effort": lower}
             return f"Reasoning effort set to: {lower}"
-        return "Usage: /reasoning [low|medium|high|off]"
+        return "Usage: /reasoning [low|medium|high|max|off]"
 
     def _cmd_fast(self, args: str, state: SessionState) -> str:
         """Toggle fast mode."""
@@ -1989,7 +2060,7 @@ class HermesACPAgent(acp.Agent):
     async def set_config_option(
         self, config_id: str, session_id: str, value: str, **kwargs: Any
     ) -> SetSessionConfigOptionResponse | None:
-        """Accept ACP config option updates even when Hermes has no typed ACP config surface yet."""
+        """Accept ACP config option updates."""
         state = self.session_manager.get_session(session_id)
         if state is None:
             logger.warning("Session %s: config update requested for missing session", session_id)
@@ -1998,6 +2069,18 @@ class HermesACPAgent(acp.Agent):
         if str(config_id) == self._EDIT_APPROVAL_POLICY_CONFIG_ID:
             mode = self._EDIT_APPROVAL_POLICY_TO_MODE.get(str(value), self._MODE_DEFAULT)
             setattr(state, "mode", mode)
+        elif str(config_id) == self._THOUGHT_LEVEL_CONFIG_ID:
+            # Apply reasoning level to the agent
+            agent = getattr(state, "agent", None)
+            lower = str(value).strip().lower()
+            if lower == "off":
+                if hasattr(agent, "reasoning_config"):
+                    agent.reasoning_config = {"enabled": False}
+                logger.info("Session %s: reasoning disabled", session_id)
+            elif lower in self._THOUGHT_LEVEL_OPTIONS:
+                if hasattr(agent, "reasoning_config"):
+                    agent.reasoning_config = {"enabled": True, "effort": lower}
+                logger.info("Session %s: reasoning effort set to %s", session_id, lower)
         else:
             options = getattr(state, "config_options", None)
             if not isinstance(options, dict):
@@ -2006,7 +2089,9 @@ class HermesACPAgent(acp.Agent):
             setattr(state, "config_options", options)
         self.session_manager.save_session(session_id)
         logger.info("Session %s: config option %s updated", session_id, config_id)
-        return SetSessionConfigOptionResponse(config_options=[])
+        return SetSessionConfigOptionResponse(
+            configOptions=self._build_thought_level_config(state),
+        )
 
     # ---- Kanban completion watcher ------------------------------------------
 
@@ -2216,3 +2301,395 @@ class HermesACPAgent(acp.Agent):
                         sub["task_id"], max_failures,
                     )
                     sub_fail_counts.pop(sub_key, None)
+
+    # ── Codex Goal Watcher ──────────────────────────────────────────────
+
+    def __init_subclass__(cls, **kw):
+        super().__init_subclass__(**kw)
+
+    # In-memory tracking of dispatched codex goals
+    _codex_goals: dict[str, dict] = {}  # goal_id → {paseo_agent_id, status, result_file, session_id, ...}
+
+    @staticmethod
+    def codex_goal_dispatch(
+        goal_prompt: str,
+        *,
+        session_id: str,
+        result_file: str = "/tmp/codex-goal-result.md",
+        cwd: str | None = None,
+        timeout_seconds: int = 0,
+    ) -> dict:
+        """Dispatch a /goal to Codex via Paseo WebSocket and register for watcher tracking.
+
+        Returns dict with goal_id, paseo_agent_id, and status.
+        """
+        import json
+        import uuid
+        import pathlib
+
+        goal_id = f"cg_{uuid.uuid4().hex[:12]}"
+        paseo_ws_url = "ws://127.0.0.1:6767/ws"
+
+        # 1. Connect to Paseo WS and send message to codex provider
+        try:
+            import subprocess
+            # Use node for WebSocket (available via Paseo deps)
+            # Single-step: create_agent_request with initialPrompt
+            # Paseo daemon v0.1.80: initialPrompt triggers execution immediately.
+            # Response comes as status(agent_created) — no separate response message.
+            js_code = """
+const WebSocket = require('ws');
+const ws = new WebSocket('WSURL');
+const ridCreate = 'create-' + Date.now();
+let done = false;
+let agentId = null;
+let step = 'init';
+ws.on('open', () => {
+  ws.send(JSON.stringify({type:'hello',clientId:'hermes-codex-goal',clientType:'cli',protocolVersion:1,appVersion:'0.1.75'}));
+});
+ws.on('message', (data) => {
+  const m = JSON.parse(data.toString());
+  const mt = m.message?.type || '';
+  if (m.type !== 'session') return;
+  const payload = m.message?.payload || {};
+
+  if (mt === 'rpc_error' && !done) {
+    console.log(JSON.stringify({status:'error', error: m.message.error || m.message.message || 'rpc error'}));
+    done = true; ws.close(); return;
+  }
+  if (mt === 'error' && !done) {
+    console.log(JSON.stringify({status:'error', error: m.message.message || 'unknown'}));
+    done = true; ws.close(); return;
+  }
+
+  if (mt === 'status') {
+    if (payload.status === 'server_info' && step === 'init') {
+      step = 'creating';
+      ws.send(JSON.stringify({type:'session',message:{
+        type:'create_agent_request',
+        requestId: ridCreate,
+        config: { provider: 'codex', cwd: CWD, modeId: 'full-access', thinkingOptionId: 'xhigh', featureValues: { fast_mode: true } },
+        initialPrompt: GOALMSG
+      }}));
+    } else if (payload.status === 'agent_created' && step === 'creating') {
+      agentId = payload.agentId;
+      console.log(JSON.stringify({status:'sent', agentId: agentId}));
+      done = true;
+      ws.close();
+    }
+  }
+});
+setTimeout(() => { if (!done) { console.log(JSON.stringify({status:'timeout'})); process.exit(1); } }, 30000);
+""".replace('WSURL', paseo_ws_url).replace('GOALMSG', json.dumps(goal_prompt)).replace('CWD', json.dumps(cwd or "/tmp"))
+
+            result = subprocess.run(
+                ["node", "-e", js_code],
+                capture_output=True, text=True, timeout=45,
+                env={
+                    **os.environ,
+                    "NODE_PATH": "/opt/homebrew/lib/node_modules/@getpaseo/cli/node_modules",
+                },
+            )
+            # Parse the JSON output
+            output = result.stdout.strip().split('\n')[-1] if result.stdout.strip() else ''
+            dispatch_result = json.loads(output) if output else {"status": "unknown"}
+
+        except Exception as exc:
+            dispatch_result = {"status": "error", "error": str(exc)}
+
+        if dispatch_result.get("status") != "sent":
+            return {
+                "goal_id": goal_id,
+                "status": "dispatch_failed",
+                "error": dispatch_result.get("error", "unknown"),
+            }
+
+        agent_id = dispatch_result.get("agentId", "")
+
+        # 2. Register in tracking dict
+        HermesACPAgent._codex_goals[goal_id] = {
+            "paseo_agent_id": agent_id,
+            "status": "dispatched",
+            "result_file": result_file,
+            "session_id": session_id,
+            "cwd": cwd or "",
+            "goal_prompt": goal_prompt[:500],
+            "dispatched_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        return {
+            "goal_id": goal_id,
+            "status": "dispatched",
+            "paseo_agent_id": agent_id,
+            "result_file": result_file,
+        }
+
+    async def _codex_goal_watcher(self, interval: float = 5.0) -> None:
+        """Poll Paseo codex agents for completion and wake idle ACP sessions.
+
+        Flow:
+        1. Dispatch: codex_goal_dispatch() sends /goal to codex via Paseo WS
+        2. Watch: this poller checks Paseo agent JSON for status change
+        3. Deliver: on completion, read result file and wake idle session via self.prompt()
+
+        Mirrors _kanban_acp_watcher structure but monitors codex agent files instead of kanban DB.
+        """
+        import pathlib
+
+        PASEO_AGENTS_DIR = pathlib.Path.home() / ".paseo" / "agents"
+
+        await asyncio.sleep(8)  # Let ACP connection establish
+
+        while True:
+            try:
+                # Re-scan workspace dirs each tick so newly created worktrees
+                # (e.g. from paseo worktree create mid-session) are discovered.
+                workspace_dirs = list(PASEO_AGENTS_DIR.iterdir()) if PASEO_AGENTS_DIR.exists() else []
+                completions = await asyncio.to_thread(
+                    self._codex_goal_collect, workspace_dirs
+                )
+                if completions:
+                    for c in completions:
+                        await self._codex_goal_deliver(c)
+            except Exception:
+                logger.debug("codex goal watcher: tick error", exc_info=True)
+            await asyncio.sleep(interval)
+
+    @staticmethod
+    def _codex_goal_collect(workspace_dirs: list) -> list[dict]:
+        """Check dispatched codex goals for completion (thread-safe).
+
+        Reads Paseo agent JSON files to detect status transitions
+        from non-closed to closed for tracked codex goal agents.
+        """
+        import json
+        import pathlib
+
+        completions: list[dict] = []
+        goals = HermesACPAgent._codex_goals
+
+        for goal_id, info in list(goals.items()):
+            if info.get("status") in ("completed", "delivered", "failed"):
+                continue
+
+            agent_id = info.get("paseo_agent_id")
+            if not agent_id:
+                continue
+
+            # Find the agent JSON across all workspace dirs
+            agent_json = None
+            for wd in workspace_dirs:
+                candidate = wd / f"{agent_id}.json"
+                if candidate.exists():
+                    agent_json = candidate
+                    break
+
+            if not agent_json:
+                continue
+
+            try:
+                data = json.loads(agent_json.read_text())
+            except Exception:
+                continue
+
+            last_status = data.get("lastStatus", "")
+            title = data.get("title", "")
+
+            # Detect completion: status is closed/error, or idle after activity.
+            # Codex returns to "idle" on completion (not "closed").
+            # attentionReason="finished" is set inconsistently (sometimes None),
+            # so we also treat idle with updated timestamp past dispatch as done.
+            attention_reason = data.get("attentionReason")
+            updated_at = data.get("updatedAt", "")
+            dispatched_at = info.get("dispatched_at", "")
+            is_done = last_status in ("closed", "error") or (
+                last_status == "idle" and attention_reason == "finished"
+            ) or (
+                last_status == "idle"
+                and updated_at
+                and dispatched_at
+                and updated_at > dispatched_at
+            )
+            if is_done:
+                # Read result file if specified
+                result_text = ""
+                result_file = info.get("result_file")
+                if result_file:
+                    try:
+                        rp = pathlib.Path(result_file)
+                        if rp.exists():
+                            result_text = rp.read_text()[:8000]
+                    except Exception:
+                        pass
+
+                # Check git changes
+                cwd = info.get("cwd", "")
+                git_summary = ""
+                if cwd:
+                    try:
+                        import subprocess
+                        diff = subprocess.run(
+                            ["git", "log", "--oneline", "-5"],
+                            capture_output=True, text=True, cwd=cwd, timeout=5,
+                        )
+                        if diff.returncode == 0:
+                            git_summary = diff.stdout.strip()[:1000]
+                    except Exception:
+                        pass
+
+                completions.append({
+                    "goal_id": goal_id,
+                    "agent_id": agent_id,
+                    "last_status": last_status,
+                    "title": title,
+                    "result_text": result_text,
+                    "git_summary": git_summary,
+                    "session_id": info.get("session_id"),
+                    "cwd": cwd,
+                })
+
+                # Mark as completed to avoid re-processing
+                goals[goal_id]["status"] = "completed"
+
+        # --- External tracking files (~/.hermes/codex-goals/) ---
+        # Supports goals dispatched by Hermes agents directly via Paseo WS
+        # (bypassing _cmd_goal). The agent writes a tracking JSON file, and
+        # this poller detects completion the same way as _codex_goals dict.
+        tracking_dir = pathlib.Path.home() / ".hermes" / "codex-goals"
+        if tracking_dir.exists():
+            for tf in tracking_dir.glob("*.json"):
+                try:
+                    td = json.loads(tf.read_text())
+                except Exception:
+                    continue
+                if td.get("status") in ("completed", "delivered", "failed"):
+                    continue
+                ext_agent_id = td.get("agent_id")
+                if not ext_agent_id:
+                    continue
+                # Find agent JSON in Paseo workspace dirs
+                agent_json = None
+                for wd in workspace_dirs:
+                    candidate = wd / f"{ext_agent_id}.json"
+                    if candidate.exists():
+                        agent_json = candidate
+                        break
+                if not agent_json:
+                    continue
+                try:
+                    data = json.loads(agent_json.read_text())
+                except Exception:
+                    continue
+                ext_last_status = data.get("lastStatus", "")
+                # Codex returns to "idle" on completion (not "closed").
+                # attentionReason="finished" is set inconsistently (sometimes None),
+                # so we also treat idle with updated timestamp past dispatch as done.
+                attention_reason = data.get("attentionReason")
+                ext_updated_at = data.get("updatedAt", "")
+                ext_dispatched_at = td.get("dispatched_at", "")
+                is_done = ext_last_status in ("closed", "error") or (
+                    ext_last_status == "idle" and attention_reason == "finished"
+                ) or (
+                    ext_last_status == "idle"
+                    and ext_updated_at
+                    and ext_dispatched_at
+                    and ext_updated_at > ext_dispatched_at
+                )
+                if not is_done:
+                    continue
+                ext_title = data.get("title", "")
+                ext_cwd = td.get("cwd", "")
+                ext_git_summary = ""
+                if ext_cwd:
+                    try:
+                        import subprocess
+                        diff = subprocess.run(
+                            ["git", "log", "--oneline", "-5"],
+                            capture_output=True, text=True, cwd=ext_cwd, timeout=5,
+                        )
+                        if diff.returncode == 0:
+                            ext_git_summary = diff.stdout.strip()[:1000]
+                    except Exception:
+                        pass
+                completions.append({
+                    "goal_id": tf.stem,
+                    "agent_id": ext_agent_id,
+                    "last_status": ext_last_status,
+                    "title": ext_title,
+                    "result_text": "",
+                    "git_summary": ext_git_summary,
+                    "session_id": td.get("session_id"),
+                    "cwd": ext_cwd,
+                })
+                # Mark as completed in tracking file
+                td["status"] = "completed"
+                tf.write_text(json.dumps(td))
+
+        return completions
+
+    async def _codex_goal_deliver(self, completion: dict) -> None:
+        """Wake idle ACP session with codex goal result."""
+        from acp.schema import TextContentBlock
+
+        goal_id = completion["goal_id"]
+        session_id = completion.get("session_id")
+        if not session_id:
+            logger.warning("codex goal watcher: no session_id for goal %s", goal_id)
+            return
+
+        state = self.session_manager.get_session(session_id)
+        if state is None:
+            logger.debug("codex goal watcher: session %s not found", session_id)
+            return
+
+        # Build wake message
+        title = completion.get("title", "Codex Goal")
+        result_text = completion.get("result_text", "")
+        git_summary = completion.get("git_summary", "")
+        last_status = completion.get("last_status", "")
+
+        status_emoji = "❌" if last_status == "error" else "✅"
+        parts = [
+            f"{status_emoji} **Codex /goal completed: {title}**\n",
+        ]
+
+        if result_text:
+            parts.append(f"**Result:**\n```\n{result_text[:3000]}\n```")
+
+        if git_summary:
+            parts.append(f"**Recent commits:**\n```\n{git_summary}\n```")
+
+        if not result_text and not git_summary:
+            parts.append("(No result file or git changes detected)")
+
+        parts.append(
+            "\nReview the results and take any follow-up action needed."
+        )
+
+        wake_text = "\n".join(parts)
+
+        # Only wake if session is idle
+        if state.is_running:
+            logger.info(
+                "codex goal watcher: session %s is busy; queuing notification",
+                session_id,
+            )
+            HermesACPAgent._codex_goals.get(goal_id, {})["status"] = "delivered"
+            return
+
+        try:
+            logger.info(
+                "codex goal watcher: waking ACP session %s for goal %s",
+                session_id, goal_id,
+            )
+            await self.prompt(
+                prompt=[TextContentBlock(type="text", text=wake_text)],
+                session_id=session_id,
+            )
+            HermesACPAgent._codex_goals.get(goal_id, {})["status"] = "delivered"
+        except Exception as exc:
+            logger.warning(
+                "codex goal watcher: failed to wake session %s: %s",
+                session_id, exc,
+            )
+            HermesACPAgent._codex_goals.get(goal_id, {})["status"] = "failed"

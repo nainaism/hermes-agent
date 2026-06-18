@@ -30,12 +30,15 @@ class CustomProfile(ProviderProfile):
             options["num_ctx"] = ollama_num_ctx
             extra_body["options"] = options
 
-        # Disable thinking when reasoning is turned off
+        # Map reasoning_config to Ollama's ``think`` parameter.
+        # Ollama supports ``think: true|false`` (toggle only, no effort levels).
         if reasoning_config and isinstance(reasoning_config, dict):
             _effort = (reasoning_config.get("effort") or "").strip().lower()
             _enabled = reasoning_config.get("enabled", True)
             if _effort == "none" or _enabled is False:
                 extra_body["think"] = False
+            else:
+                extra_body["think"] = True
 
         return extra_body, {}
 
